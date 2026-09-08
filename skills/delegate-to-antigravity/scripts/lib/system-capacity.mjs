@@ -18,13 +18,36 @@ function parseInteger(val, name, min, max) {
   return num;
 }
 
-function parseNumber(val, name, min, max) {
+function parseNumber(val, name, min, max, exclusiveMin = false) {
   if (val === undefined || val === null || val === "") return undefined;
   const num = Number(String(val).trim());
-  if (!Number.isFinite(num) || (min !== undefined && num < min) || (max !== undefined && num > max)) {
+  const outOfMin = min !== undefined && (exclusiveMin ? num <= min : num < min);
+  if (!Number.isFinite(num) || outOfMin || (max !== undefined && num > max)) {
     throw new Error(`Invalid ${name}: ${val} is not a valid number`);
   }
   return num;
+}
+
+export function validateSample(sample) {
+  if (!sample || typeof sample !== "object") {
+    throw new Error("Invalid sample: must be an object");
+  }
+  const { logicalCpuCount, totalMemoryBytes, freeMemoryBytes, cpuUtilizationRatio } = sample;
+  if (typeof logicalCpuCount !== "number" || !Number.isInteger(logicalCpuCount) || logicalCpuCount <= 0) {
+    throw new Error("Invalid sample: logicalCpuCount must be a positive integer");
+  }
+  if (typeof totalMemoryBytes !== "number" || !Number.isFinite(totalMemoryBytes) || totalMemoryBytes < 0) {
+    throw new Error("Invalid sample: totalMemoryBytes must be a finite non-negative number");
+  }
+  if (typeof freeMemoryBytes !== "number" || !Number.isFinite(freeMemoryBytes) || freeMemoryBytes < 0) {
+    throw new Error("Invalid sample: freeMemoryBytes must be a finite non-negative number");
+  }
+  if (freeMemoryBytes > totalMemoryBytes) {
+    throw new Error("Invalid sample: freeMemoryBytes exceeds totalMemoryBytes");
+  }
+  if (typeof cpuUtilizationRatio !== "number" || !Number.isFinite(cpuUtilizationRatio) || cpuUtilizationRatio < 0 || cpuUtilizationRatio > 1) {
+    throw new Error("Invalid sample: cpuUtilizationRatio must be between 0 and 1");
+  }
 }
 
 function normalizeCpuSnapshot(snap) {
@@ -96,24 +119,29 @@ export async function sampleSystemCapacity(options = {}) {
   const freeMemoryBytes = options.freeMemoryBytes ?? (osMod.freemem ? osMod.freemem() : 0);
   const freeMemoryRatio = totalMemoryBytes > 0 ? Math.round((freeMemoryBytes / totalMemoryBytes) * 10000) / 10000 : 0;
 
-  return {
+  const sample = {
     logicalCpuCount: Number(logicalCpuCount),
     totalMemoryBytes: Number(totalMemoryBytes),
     freeMemoryBytes: Number(freeMemoryBytes),
     freeMemoryRatio,
     cpuUtilizationRatio,
   };
+  validateSample(sample);
+  return sample;
 }
 
 export function recommendWorkerCapacity(sample, options = {}) {
+  validateSample(sample);
+
   const env = options.env ?? process.env;
-  const fixedSlots = parseInteger(env.AGY_WORKER_SLOTS, "AGY_WORKER_SLOTS", 1, 8) ?? parseInteger(options.workerSlots, "workerSlots", 1, 8);
-  const envMin = parseInteger(env.AGY_WORKER_MIN, "AGY_WORKER_MIN", 1);
-  const optMin = parseInteger(options.minWorkers, "minWorkers", 1);
+  const fixedSlots = parseInteger(env.AGY_WORKER_SLOTS, "AGY_WORKER_SLOTS", 1, DEFAULT_MAX_WORKERS)
+    ?? parseInteger(options.workerSlots ?? options.slots, "workerSlots", 1, DEFAULT_MAX_WORKERS);
+  const envMin = parseInteger(env.AGY_WORKER_MIN, "AGY_WORKER_MIN", 1, DEFAULT_MAX_WORKERS);
+  const optMin = parseInteger(options.minWorkers, "minWorkers", 1, DEFAULT_MAX_WORKERS);
   let minWorkers = envMin ?? optMin ?? DEFAULT_MIN_WORKERS;
 
-  const envMax = parseInteger(env.AGY_WORKER_MAX, "AGY_WORKER_MAX", 1);
-  const optMax = parseInteger(options.maxWorkers, "maxWorkers", 1);
+  const envMax = parseInteger(env.AGY_WORKER_MAX, "AGY_WORKER_MAX", 1, DEFAULT_MAX_WORKERS);
+  const optMax = parseInteger(options.maxWorkers, "maxWorkers", 1, DEFAULT_MAX_WORKERS);
   let maxWorkers = envMax ?? optMax ?? DEFAULT_MAX_WORKERS;
 
   if (fixedSlots !== undefined) {
@@ -132,25 +160,28 @@ export function recommendWorkerCapacity(sample, options = {}) {
 
   const workerMemoryMb = parseNumber(env.AGY_WORKER_MEMORY_MB, "AGY_WORKER_MEMORY_MB", 1) ?? parseNumber(options.workerMemoryMb, "workerMemoryMb", 1) ?? DEFAULT_WORKER_MEMORY_MB;
   const workerMemoryBytes = Math.round(workerMemoryMb * MIB_IN_BYTES);
-  const cpuHighPercent = parseNumber(env.AGY_WORKER_CPU_HIGH_PERCENT, "AGY_WORKER_CPU_HIGH_PERCENT", 0, 100) ?? parseNumber(options.cpuHighPercent, "cpuHighPercent", 0, 100) ?? DEFAULT_CPU_HIGH_PERCENT;
+  const envCpu = parseNumber(env.AGY_WORKER_CPU_HIGH_PERCENT, "AGY_WORKER_CPU_HIGH_PERCENT", 0, 100, true);
+  const optCpu = parseNumber(options.cpuHighPercent, "cpuHighPercent", 0, 100, true);
+  const optThresh = parseNumber(options.threshold, "threshold", 0, 100, true);
+  const optCpuThresh = parseNumber(options.cpuThreshold, "cpuThreshold", 0, 100, true);
+  const cpuHighPercent = envCpu ?? optCpu ?? optThresh ?? optCpuThresh ?? DEFAULT_CPU_HIGH_PERCENT;
   const cpuHighRatio = cpuHighPercent / 100;
   const activeWorkers = parseInteger(options.activeWorkers ?? 0, "activeWorkers", 0) ?? 0;
 
-  const logicalCpuCount = Number(sample?.logicalCpuCount ?? 1);
-  const totalMemoryBytes = Number(sample?.totalMemoryBytes ?? 0);
-  const freeMemoryBytes = Number(sample?.freeMemoryBytes ?? 0);
-  const freeMemoryRatio = typeof sample?.freeMemoryRatio === "number"
+  const logicalCpuCount = sample.logicalCpuCount;
+  const totalMemoryBytes = sample.totalMemoryBytes;
+  const freeMemoryBytes = sample.freeMemoryBytes;
+  const freeMemoryRatio = typeof sample.freeMemoryRatio === "number"
     ? sample.freeMemoryRatio
     : (totalMemoryBytes > 0 ? Math.round((freeMemoryBytes / totalMemoryBytes) * 10000) / 10000 : 0);
-  const cpuUtilizationRatio = Number(sample?.cpuUtilizationRatio ?? 0);
+  const cpuUtilizationRatio = sample.cpuUtilizationRatio;
 
   const cpuSlots = logicalCpuCount > 1 ? logicalCpuCount - 1 : 1;
   const reservedMemoryBytes = Math.max(GIB_IN_BYTES, Math.floor(totalMemoryBytes * 0.10));
-  const availableMemoryBytes = Math.max(0, totalMemoryBytes - reservedMemoryBytes);
+  const availableMemoryBytes = Math.max(0, freeMemoryBytes - reservedMemoryBytes);
   const memSlots = Math.floor(availableMemoryBytes / workerMemoryBytes);
 
-  const freeAfterReserve = freeMemoryBytes - reservedMemoryBytes;
-  const insufficientMemory = freeMemoryBytes < reservedMemoryBytes || freeAfterReserve < workerMemoryBytes;
+  const insufficientMemory = freeMemoryBytes < reservedMemoryBytes || availableMemoryBytes < workerMemoryBytes;
   const cpuSaturated = cpuUtilizationRatio >= cpuHighRatio;
 
   let recommendedSlots;

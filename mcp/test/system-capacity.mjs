@@ -52,14 +52,14 @@ test("recommendWorkerCapacity: defaults, CPU reservation, and memory-based sizin
   const sample = {
     logicalCpuCount: 8,
     totalMemoryBytes: 16 * GIB_IN_BYTES,
-    freeMemoryBytes: 10 * GIB_IN_BYTES,
+    freeMemoryBytes: 14 * GIB_IN_BYTES,
     cpuUtilizationRatio: 0.2,
   };
   const rec = recommendWorkerCapacity(sample, { env: {} });
   assert.equal(rec.logicalCpuCount, 8);
   assert.equal(rec.totalMemoryBytes, 16 * GIB_IN_BYTES);
-  assert.equal(rec.freeMemoryBytes, 10 * GIB_IN_BYTES);
-  assert.equal(rec.freeMemoryRatio, 0.625);
+  assert.equal(rec.freeMemoryBytes, 14 * GIB_IN_BYTES);
+  assert.equal(rec.freeMemoryRatio, 0.875);
   assert.equal(rec.cpuUtilizationRatio, 0.2);
   assert.equal(rec.activeWorkers, 0);
   assert.equal(rec.recommendedSlots, 7);
@@ -75,8 +75,8 @@ test("recommendWorkerCapacity: memory constrained host", () => {
     cpuUtilizationRatio: 0.1,
   };
   const rec = recommendWorkerCapacity(sample, { env: {} });
-  assert.equal(rec.recommendedSlots, 2);
-  assert.equal(rec.availableSlots, 2);
+  assert.equal(rec.recommendedSlots, 1);
+  assert.equal(rec.availableSlots, 1);
   assert.equal(rec.limitedBy, "memory");
 });
 
@@ -208,4 +208,65 @@ test("recommendWorkerCapacity: rejects invalid and ambiguous bounds", () => {
   assert.throws(() => recommendWorkerCapacity(sample, { env: { AGY_WORKER_MEMORY_MB: "-100" } }));
   assert.throws(() => recommendWorkerCapacity(sample, { env: { AGY_WORKER_CPU_HIGH_PERCENT: "150" } }));
   assert.throws(() => recommendWorkerCapacity(sample, { activeWorkers: -1 }));
+});
+
+test("recommendWorkerCapacity: regression - sizes memory slots from free memory on 64GiB host with 10GiB free", () => {
+  const sample = {
+    logicalCpuCount: 16,
+    totalMemoryBytes: 64 * GIB_IN_BYTES,
+    freeMemoryBytes: 10 * GIB_IN_BYTES,
+    cpuUtilizationRatio: 0.2,
+  };
+  const rec = recommendWorkerCapacity(sample, { env: {} });
+  assert.equal(rec.recommendedSlots, 2);
+  assert.equal(rec.availableSlots, 2);
+  assert.equal(rec.limitedBy, "memory");
+});
+
+test("recommendWorkerCapacity: enforces hard cap 8 on env and option min/max/fixed values (>8)", () => {
+  const sample = {
+    logicalCpuCount: 8,
+    totalMemoryBytes: 16 * GIB_IN_BYTES,
+    freeMemoryBytes: 14 * GIB_IN_BYTES,
+    cpuUtilizationRatio: 0.1,
+  };
+
+  assert.throws(() => recommendWorkerCapacity(sample, { maxWorkers: 9 }));
+  assert.throws(() => recommendWorkerCapacity(sample, { minWorkers: 9 }));
+  assert.throws(() => recommendWorkerCapacity(sample, { workerSlots: 9 }));
+  assert.throws(() => recommendWorkerCapacity(sample, { env: { AGY_WORKER_MAX: "9" } }));
+  assert.throws(() => recommendWorkerCapacity(sample, { env: { AGY_WORKER_MIN: "9" } }));
+  assert.throws(() => recommendWorkerCapacity(sample, { env: { AGY_WORKER_SLOTS: "9" } }));
+  assert.throws(() => recommendWorkerCapacity(sample, { env: { AGY_WORKER_MAX: "12" } }));
+  assert.throws(() => recommendWorkerCapacity(sample, { env: { AGY_WORKER_MIN: "10" } }));
+});
+
+test("recommendWorkerCapacity: rejects malformed sample and invalid threshold", () => {
+  const validSample = {
+    logicalCpuCount: 4,
+    totalMemoryBytes: 8 * GIB_IN_BYTES,
+    freeMemoryBytes: 4 * GIB_IN_BYTES,
+    cpuUtilizationRatio: 0.2,
+  };
+
+  assert.throws(() => recommendWorkerCapacity(null));
+  assert.throws(() => recommendWorkerCapacity(undefined));
+  assert.throws(() => recommendWorkerCapacity("invalid"));
+  assert.throws(() => recommendWorkerCapacity({ ...validSample, logicalCpuCount: 0 }));
+  assert.throws(() => recommendWorkerCapacity({ ...validSample, logicalCpuCount: -1 }));
+  assert.throws(() => recommendWorkerCapacity({ ...validSample, logicalCpuCount: 2.5 }));
+  assert.throws(() => recommendWorkerCapacity({ ...validSample, logicalCpuCount: "4" }));
+  assert.throws(() => recommendWorkerCapacity({ ...validSample, totalMemoryBytes: -1 }));
+  assert.throws(() => recommendWorkerCapacity({ ...validSample, totalMemoryBytes: Infinity }));
+  assert.throws(() => recommendWorkerCapacity({ ...validSample, freeMemoryBytes: -1 }));
+  assert.throws(() => recommendWorkerCapacity({ ...validSample, freeMemoryBytes: 10 * GIB_IN_BYTES, totalMemoryBytes: 8 * GIB_IN_BYTES }));
+  assert.throws(() => recommendWorkerCapacity({ ...validSample, cpuUtilizationRatio: -0.1 }));
+  assert.throws(() => recommendWorkerCapacity({ ...validSample, cpuUtilizationRatio: 1.05 }));
+
+  assert.throws(() => recommendWorkerCapacity(validSample, { cpuHighPercent: 0 }));
+  assert.throws(() => recommendWorkerCapacity(validSample, { cpuHighPercent: -5 }));
+  assert.throws(() => recommendWorkerCapacity(validSample, { cpuHighPercent: 101 }));
+  assert.throws(() => recommendWorkerCapacity(validSample, { threshold: 0 }));
+  assert.throws(() => recommendWorkerCapacity(validSample, { threshold: 101 }));
+  assert.throws(() => recommendWorkerCapacity(validSample, { env: { AGY_WORKER_CPU_HIGH_PERCENT: "0" } }));
 });
