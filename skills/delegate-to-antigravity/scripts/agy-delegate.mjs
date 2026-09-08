@@ -45,7 +45,7 @@ function parseArgs(argv) {
   const options = {};
   for (let index = 0; index < argv.length; index += 1) {
     const key = argv[index];
-    if (["--check", "--help", "--async", "--cleanup-prompt-file", "--internal-run"].includes(key)) {
+    if (["--check", "--help", "--async", "--cleanup-prompt-file", "--internal-run", "--sparse-checkout"].includes(key)) {
       options[key.slice(2)] = true;
       continue;
     }
@@ -346,7 +346,7 @@ const options = parseArgs(process.argv.slice(2));
 
 if (options.help) {
   process.stdout.write(
-    "Usage: agy-delegate.mjs --check | --job-action ACTION [--job-args-json JSON] | --cwd PATH --prompt-file PATH [--targets-json JSON] [--mode plan|accept-edits] [--isolation shared|worktree] [--resume-job-id ID] [--notify-thread ID --async]\n",
+    "Usage: agy-delegate.mjs --check | --job-action ACTION [--job-args-json JSON] | --cwd PATH --prompt-file PATH [--targets-json JSON] [--mode plan|accept-edits] [--isolation shared|worktree] [--sparse-checkout] [--resume-job-id ID] [--notify-thread ID --async]\n",
   );
   process.exit(0);
 }

@@ -34,7 +34,28 @@ export function resolveRunConfig(options = {}) {
   const retentionMinutes = Number(options["retention-minutes"] ?? options.retentionMinutes ?? DEFAULT_RETENTION_MINUTES);
   if (!Number.isInteger(retentionMinutes) || retentionMinutes < 10 || retentionMinutes > 10080) throw new Error("--retention-minutes must be an integer from 10 to 10080");
   const targets = normalizeTargets(parseJsonOption(options["targets-json"] ?? options.targets, []));
-  return { mode, async: asyncRun, isolation, timeoutSeconds, retentionMinutes, targets, outputFormat: options["output-format"] ?? options.outputFormat ?? "text" };
+  const rawSparseCheckout = options["sparse-checkout"] ?? options.sparseCheckout;
+  let sparseCheckout = false;
+  if (rawSparseCheckout !== undefined) {
+    if (typeof rawSparseCheckout === "boolean") {
+      sparseCheckout = rawSparseCheckout;
+    } else if (rawSparseCheckout === "true" || rawSparseCheckout === "") {
+      sparseCheckout = true;
+    } else if (rawSparseCheckout === "false") {
+      sparseCheckout = false;
+    } else {
+      throw new Error("--sparse-checkout must be a boolean");
+    }
+  }
+  if (sparseCheckout) {
+    if (isolation !== "worktree") {
+      throw new Error("sparseCheckout requires worktree isolation");
+    }
+    if (targets.length === 0) {
+      throw new Error("sparseCheckout requires at least one declared target");
+    }
+  }
+  return { mode, async: asyncRun, isolation, timeoutSeconds, retentionMinutes, targets, sparseCheckout, outputFormat: options["output-format"] ?? options.outputFormat ?? "text" };
 }
 
 // The first line is the stable public response. MCP consumes the metadata line.
@@ -66,7 +87,7 @@ function worktreePathFor(root, repoIdentity, jobId) {
 }
 
 function jobMetadata(config, params, repo) {
-  return { mode: config.mode, isolation: config.isolation, targets: config.targets, retentionMinutes: config.retentionMinutes, callbackThread: params.callbackThread ?? null, repoIdentity: repo?.identity ?? null, baseSha: repo?.headSha ?? null };
+  return { mode: config.mode, isolation: config.isolation, targets: config.targets, sparseCheckout: config.sparseCheckout, retentionMinutes: config.retentionMinutes, callbackThread: params.callbackThread ?? null, repoIdentity: repo?.identity ?? null, baseSha: repo?.headSha ?? null };
 }
 
 export async function persistBeforeSpawn({ root, params = {}, now = Date.now() } = {}) {
@@ -89,6 +110,7 @@ export async function persistBeforeSpawn({ root, params = {}, now = Date.now() }
     if (job.manifest.metadata?.isolation !== "worktree" || config.isolation !== "worktree") throw new Error("Only worktree-isolated jobs can be resumed");
     if (config.mode !== job.manifest.metadata.mode) throw new Error("Resume mode does not match the recorded job mode");
     if (JSON.stringify(config.targets) !== JSON.stringify(job.manifest.metadata.targets ?? [])) throw new Error("Resume targets do not match the recorded job targets");
+    if (config.sparseCheckout !== Boolean(job.manifest.metadata?.sparseCheckout)) throw new Error("Resume sparseCheckout does not match the recorded job sparseCheckout");
     repo = validateRepository(requestedCwd, { requireClean: true, expectedIdentity: job.manifest.metadata.repoIdentity });
     if (repo.repoRoot.toLowerCase() !== path.resolve(job.manifest.cwd).toLowerCase()) throw new Error("Resume workspace does not match the recorded canonical repository");
     if (repo.headSha !== job.manifest.metadata.baseSha) throw new Error("Resume repository HEAD does not match the recorded base commit");
@@ -108,13 +130,17 @@ export async function persistBeforeSpawn({ root, params = {}, now = Date.now() }
     await updateJobState(stateRoot, job.jobId, { lifecycle: "queued" }, { now });
     if (config.isolation === "worktree") {
       worktreePath = worktreePathFor(stateRoot, repo.identity, job.jobId);
-      await createWorktree({ repoRoot: repo.repoRoot, worktreePath, baseSha: repo.headSha, callerId: job.jobId });
+      const worktreeOptions = { repoRoot: repo.repoRoot, worktreePath, baseSha: repo.headSha, callerId: job.jobId };
+      if (config.sparseCheckout) {
+        worktreeOptions.checkoutPaths = config.targets;
+      }
+      await createWorktree(worktreeOptions);
     }
   }
 
   const attemptId = generateUuid();
   const executionCwd = worktreePath ?? requestedCwd;
-  const attempt = await createAttempt(stateRoot, job.jobId, { attemptId, attemptIndex, metadata: { isolation: config.isolation, worktreePath, executionCwd, repoRoot: repo?.repoRoot ?? null, repoIdentity: repo?.identity ?? null, baseSha: repo?.headSha ?? job.manifest.metadata?.baseSha ?? null, targets: config.targets, resumeSessionId } }, { now });
+  const attempt = await createAttempt(stateRoot, job.jobId, { attemptId, attemptIndex, metadata: { isolation: config.isolation, worktreePath, executionCwd, repoRoot: repo?.repoRoot ?? null, repoIdentity: repo?.identity ?? null, baseSha: repo?.headSha ?? job.manifest.metadata?.baseSha ?? null, targets: config.targets, sparseCheckout: config.sparseCheckout, resumeSessionId } }, { now });
   if (config.mode === "accept-edits") await updateAttemptState(stateRoot, job.jobId, attemptId, { artifact: "pending" }, { now });
 
   const prompt = String(params.prompt ?? "");

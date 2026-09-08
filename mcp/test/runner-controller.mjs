@@ -25,6 +25,10 @@ async function initRepo() {
   runGit(["config", "core.autocrlf", "false"], { cwd: repo });
   await fsp.writeFile(path.join(repo, "owned.txt"), "before\n");
   await fsp.writeFile(path.join(repo, "unrelated.txt"), "keep\n");
+  await fsp.mkdir(path.join(repo, "pkg"), { recursive: true });
+  await fsp.writeFile(path.join(repo, "pkg", "feature.txt"), "feature\n");
+  await fsp.mkdir(path.join(repo, "subtree"), { recursive: true });
+  await fsp.writeFile(path.join(repo, "subtree", "nested.txt"), "nested keep\n");
   runGit(["add", "-A"], { cwd: repo });
   runGit(["commit", "-m", "base"], { cwd: repo });
   return repo;
@@ -37,6 +41,15 @@ function terminal(worker, sessionId = "session-1") {
 test("safe defaults, retention bounds, and exact async public response", () => {
   assert.equal(resolveRunConfig({ mode: "plan" }).isolation, "shared");
   assert.equal(resolveRunConfig({ mode: "accept-edits", targets: ["a.txt"] }).isolation, "worktree");
+  assert.equal(resolveRunConfig({ mode: "plan" }).sparseCheckout, false);
+  assert.equal(resolveRunConfig({ mode: "accept-edits", targets: ["a.txt"] }).sparseCheckout, false);
+  assert.equal(resolveRunConfig({ mode: "accept-edits", targets: ["a.txt"], sparseCheckout: true }).sparseCheckout, true);
+  assert.equal(resolveRunConfig({ mode: "accept-edits", targets: ["a.txt"], "sparse-checkout": true }).sparseCheckout, true);
+  assert.throws(() => resolveRunConfig({ mode: "plan", sparseCheckout: true, targets: ["a.txt"] }), /sparseCheckout requires worktree isolation/);
+  assert.throws(() => resolveRunConfig({ mode: "accept-edits", isolation: "shared", sparseCheckout: true, targets: ["a.txt"] }), /sparseCheckout requires worktree isolation|Unsafe isolation/);
+  assert.throws(() => resolveRunConfig({ mode: "accept-edits", sparseCheckout: true, targets: [] }), /sparseCheckout requires at least one declared target/);
+  assert.throws(() => resolveRunConfig({ mode: "plan", isolation: "worktree", sparseCheckout: true, targets: [] }), /sparseCheckout requires at least one declared target/);
+  assert.throws(() => resolveRunConfig({ mode: "accept-edits", targets: ["a.txt"], sparseCheckout: "not-bool" }), /--sparse-checkout must be a boolean/);
   assert.throws(() => resolveRunConfig({ mode: "accept-edits", isolation: "shared", targets: ["a.txt"] }), /Unsafe isolation/);
   assert.throws(() => resolveRunConfig({ mode: "plan", retentionMinutes: 9 }), /10 to 10080/);
   const output = exactAsyncResponse("thread-1", { jobId: "job-1", attempt: 1 });
@@ -221,6 +234,179 @@ test("finalize with old attemptId is blocked and worktree is retained while newe
     const finalized = await runJobAction(root, "finalize", prepared.job.jobId, { attemptId: prepared.attempt.attemptId });
     assert.equal(finalized.finalized, true);
     await assert.rejects(fsp.stat(prepared.executionCwd), { code: "ENOENT" });
+  } finally {
+    await fsp.rm(root, { recursive: true, force: true });
+    await fsp.rm(repo, { recursive: true, force: true });
+  }
+});
+
+test("sparse checkout defaults to false and full checkout retains unrelated subtree and supports new-file targets", async () => {
+  const root = await tempRoot("agy-controller-state-");
+  const repo = await initRepo();
+  try {
+    const prepared = await persistBeforeSpawn({
+      root,
+      params: { cwd: repo, mode: "accept-edits", targets: ["pkg/feature.txt"], prompt: "inspect feature" },
+    });
+    assert.equal(prepared.config.sparseCheckout, false);
+    assert.equal(prepared.job.manifest.metadata?.sparseCheckout, false);
+    assert.equal(prepared.attempt.manifest.metadata?.sparseCheckout, false);
+    const context = await getRunContext(root, prepared.job.jobId, prepared.attempt.attemptId);
+    assert.equal(context.config.sparseCheckout, false);
+
+    const unrelatedStat = await fsp.stat(path.join(prepared.executionCwd, "subtree", "nested.txt"));
+    assert.equal(unrelatedStat.isFile(), true);
+    await runJobAction(root, "finalize", prepared.job.jobId);
+
+    const newFileJob = await persistBeforeSpawn({
+      root,
+      params: { cwd: repo, mode: "accept-edits", targets: ["pkg/brand-new.txt"], prompt: "create brand-new" },
+    });
+    assert.equal(newFileJob.config.sparseCheckout, false);
+    assert.equal(newFileJob.job.manifest.metadata?.sparseCheckout, false);
+    await runJobAction(root, "finalize", newFileJob.job.jobId);
+  } finally {
+    await fsp.rm(root, { recursive: true, force: true });
+    await fsp.rm(repo, { recursive: true, force: true });
+  }
+});
+
+test("sparse true excludes unrelated subtree while missing target file throws PATH_NOT_FOUND", async () => {
+  const root = await tempRoot("agy-controller-state-");
+  const repo = await initRepo();
+  try {
+    const prepared = await persistBeforeSpawn({
+      root,
+      params: {
+        cwd: repo,
+        mode: "accept-edits",
+        targets: ["pkg/feature.txt"],
+        sparseCheckout: true,
+        prompt: "sparse edit",
+      },
+    });
+    assert.equal(prepared.config.sparseCheckout, true);
+    assert.equal(prepared.job.manifest.metadata?.sparseCheckout, true);
+    assert.equal(prepared.attempt.manifest.metadata?.sparseCheckout, true);
+
+    const targetStat = await fsp.stat(path.join(prepared.executionCwd, "pkg", "feature.txt"));
+    assert.equal(targetStat.isFile(), true);
+
+    await assert.rejects(
+      fsp.stat(path.join(prepared.executionCwd, "subtree", "nested.txt")),
+      { code: "ENOENT" },
+    );
+
+    await runJobAction(root, "finalize", prepared.job.jobId);
+
+    await assert.rejects(
+      persistBeforeSpawn({
+        root,
+        params: {
+          cwd: repo,
+          mode: "accept-edits",
+          targets: ["pkg/nonexistent.txt"],
+          sparseCheckout: true,
+          prompt: "should fail",
+        },
+      }),
+      (err) => err.code === "PATH_NOT_FOUND" || /PATH_NOT_FOUND|not found/i.test(err.message),
+    );
+  } finally {
+    await fsp.rm(root, { recursive: true, force: true });
+    await fsp.rm(repo, { recursive: true, force: true });
+  }
+});
+
+test("resume must exactly match recorded sparseCheckout and reuse existing worktree", async () => {
+  const root = await tempRoot("agy-controller-state-");
+  const repo = await initRepo();
+  try {
+    const sparseJob = await persistBeforeSpawn({
+      root,
+      params: {
+        cwd: repo,
+        mode: "accept-edits",
+        targets: ["pkg/feature.txt"],
+        sparseCheckout: true,
+        prompt: "sparse first attempt",
+      },
+    });
+    await fsp.writeFile(path.join(sparseJob.executionCwd, "pkg", "feature.txt"), "updated\n");
+    await completeRun(root, sparseJob.job.jobId, sparseJob.attempt.attemptId, {
+      exitCode: 0,
+      stdout: terminal({ status: "success", summary: "sparse attempt 1", verification: "ok", diagnostics: [], claimedChangedPaths: ["pkg/feature.txt"] }, "session-sparse-1"),
+      stderr: "",
+      timedOut: false,
+      truncated: false,
+    });
+
+    await assert.rejects(
+      persistBeforeSpawn({
+        root,
+        params: {
+          cwd: repo,
+          mode: "accept-edits",
+          targets: ["pkg/feature.txt"],
+          sparseCheckout: false,
+          prompt: "sparse mismatch attempt",
+          resumeJobId: sparseJob.job.jobId,
+        },
+      }),
+      /Resume sparseCheckout does not match/,
+    );
+
+    const resumed = await persistBeforeSpawn({
+      root,
+      params: {
+        cwd: repo,
+        mode: "accept-edits",
+        targets: ["pkg/feature.txt"],
+        sparseCheckout: true,
+        prompt: "sparse second attempt",
+        resumeJobId: sparseJob.job.jobId,
+      },
+    });
+    assert.equal(resumed.attempt.manifest.attemptIndex, 2);
+    assert.equal(resumed.executionCwd, sparseJob.executionCwd);
+    assert.equal(resumed.attempt.manifest.metadata?.sparseCheckout, true);
+    assert.equal(await fsp.readFile(path.join(resumed.executionCwd, "pkg", "feature.txt"), "utf8"), "updated\n");
+
+    await runJobAction(root, "finalize", sparseJob.job.jobId);
+
+    const fullJob = await persistBeforeSpawn({
+      root,
+      params: {
+        cwd: repo,
+        mode: "accept-edits",
+        targets: ["owned.txt"],
+        prompt: "full first attempt",
+      },
+    });
+    await completeRun(root, fullJob.job.jobId, fullJob.attempt.attemptId, {
+      exitCode: 0,
+      stdout: terminal({ status: "success", summary: "full attempt 1", verification: "ok", diagnostics: [], claimedChangedPaths: ["owned.txt"] }, "session-full-1"),
+      stderr: "",
+      timedOut: false,
+      truncated: false,
+    });
+
+    await assert.rejects(
+      persistBeforeSpawn({
+        root,
+        params: {
+          cwd: repo,
+          mode: "accept-edits",
+          targets: ["owned.txt"],
+          sparseCheckout: true,
+          prompt: "full mismatch attempt",
+          resumeJobId: fullJob.job.jobId,
+        },
+      }),
+      /Resume sparseCheckout does not match/,
+    );
+
+    await runJobAction(root, "finalize", fullJob.job.jobId);
   } finally {
     await fsp.rm(root, { recursive: true, force: true });
     await fsp.rm(repo, { recursive: true, force: true });
