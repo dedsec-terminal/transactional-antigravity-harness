@@ -1,0 +1,581 @@
+import { describe, it, beforeEach, afterEach } from "node:test";
+import assert from "node:assert/strict";
+import fsp from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
+
+import {
+  parseProcessDate,
+  compareProcessDates,
+  compareExecutables,
+  compareCommandLines,
+  validateProcessIdentity,
+  queryProcessIdentity,
+  writeCancellationMarker,
+  readCancellationMarker,
+  terminateProcess,
+  spawnDetachedWorker,
+  WindowsProcessSupervisor,
+} from "../../skills/delegate-to-antigravity/scripts/lib/windows-process.mjs";
+
+import {
+  DEFAULT_MAX_SLOTS,
+  acquireSlot,
+  releaseSlot,
+  classifyLease,
+  scanLeases,
+  reclaimLeases,
+  getActiveCount,
+  getAvailableCount,
+  getCounts,
+  detectOrphanProcesses,
+  SlotLeaseManager,
+} from "../../skills/delegate-to-antigravity/scripts/lib/leases.mjs";
+
+describe("Windows Process Supervision and Max-Four Slot Leasing", () => {
+  let tmpRoot;
+
+  beforeEach(async () => {
+    tmpRoot = await fsp.mkdtemp(path.join(os.tmpdir(), "agy-process-leases-test-"));
+  });
+
+  afterEach(async () => {
+    if (tmpRoot) {
+      await fsp.rm(tmpRoot, { recursive: true, force: true }).catch(() => {});
+    }
+  });
+
+  describe("1. PID reuse mismatch blocks kill and reclaim", () => {
+    it("never kills when PID is reused by another process with mismatched identity", async () => {
+      const taskkillCalls = [];
+      const recordedIdentity = {
+        pid: 6100,
+        creationTime: "2026-09-07T10:00:00.000Z",
+        executable: "C:\\Program Files\\nodejs\\node.exe",
+        commandLine: "node worker.js",
+      };
+
+      // Mock CIM query returning a different process that re-used PID 6100
+      const mockRunner = async ({ command, args }) => {
+        if (command === "powershell.exe") {
+          return {
+            exitCode: 0,
+            stdout: JSON.stringify({
+              ProcessId: 6100,
+              CreationDate: "/Date(1788799000000)/", // Later time
+              ExecutablePath: "C:\\Windows\\System32\\svchost.exe", // Different executable!
+              CommandLine: "svchost.exe -k netsvcs",
+            }),
+            stderr: "",
+          };
+        }
+        if (command === "taskkill") {
+          taskkillCalls.push({ command, args });
+          return { exitCode: 0, stdout: "", stderr: "" };
+        }
+        return { exitCode: 0, stdout: "", stderr: "" };
+      };
+
+      const events = [];
+      const result = await terminateProcess({
+        pid: 6100,
+        identity: recordedIdentity,
+        commandRunner: mockRunner,
+        platform: "win32",
+        events,
+      });
+
+      assert.equal(result.stopped, false, "Process must not be reported stopped");
+      assert.equal(result.blocked, true, "Kill must be blocked");
+      assert.equal(result.reason, "identity_mismatch");
+      assert.equal(taskkillCalls.length, 0, "taskkill must NEVER be called on identity mismatch");
+
+      const blockedEvent = events.find((e) => e.type === "identity_mismatch_kill_blocked");
+      assert.ok(blockedEvent, "Identity mismatch event must be recorded");
+    });
+
+    it("never reclaims a slot whose owner has PID reuse mismatch and reports it as ambiguous", async () => {
+      const taskkillCalls = [];
+      const recordedIdentity = {
+        pid: 6200,
+        creationTime: "2026-09-07T08:00:00.000Z",
+        executable: "C:\\Program Files\\nodejs\\node.exe",
+        commandLine: "node worker.js",
+      };
+
+      const mockRunner = async ({ command, args }) => {
+        if (command === "powershell.exe") {
+          return {
+            exitCode: 0,
+            stdout: JSON.stringify({
+              ProcessId: 6200,
+              CreationDate: "/Date(1788799999000)/",
+              ExecutablePath: "C:\\Windows\\System32\\notepad.exe",
+              CommandLine: "notepad.exe text.txt",
+            }),
+            stderr: "",
+          };
+        }
+        if (command === "taskkill") {
+          taskkillCalls.push({ command, args });
+          return { exitCode: 0, stdout: "", stderr: "" };
+        }
+        return { exitCode: 0, stdout: "", stderr: "" };
+      };
+
+      const supervisor = new WindowsProcessSupervisor({
+        commandRunner: mockRunner,
+        platform: "win32",
+      });
+
+      // Acquire slot 0 with the initial identity
+      const acquireResult = await acquireSlot({
+        stateRoot: tmpRoot,
+        jobId: "job-mismatch",
+        attemptId: "att-1",
+        processIdentity: recordedIdentity,
+        processSupervisor: supervisor,
+      });
+      assert.equal(acquireResult.acquired, true);
+      assert.equal(acquireResult.slotId, 0);
+
+      // Attempt reclamation
+      const reclaimResult = await reclaimLeases({
+        stateRoot: tmpRoot,
+        processSupervisor: supervisor,
+      });
+
+      assert.equal(reclaimResult.reclaimed.length, 0, "No leases should be reclaimed");
+      assert.equal(reclaimResult.ambiguous.length, 1, "Slot must be reported as ambiguous");
+      assert.equal(reclaimResult.ambiguous[0].slotId, 0);
+      assert.equal(reclaimResult.ambiguous[0].reason, "pid_reuse_mismatch");
+      assert.equal(taskkillCalls.length, 0, "taskkill must not be called");
+
+      // Verify slot file still exists on disk
+      const slotFile = path.join(tmpRoot, "locks", "slots", "slot-0.json");
+      const stat = await fsp.stat(slotFile);
+      assert.ok(stat.isFile(), "Slot file must remain intact and not deleted");
+    });
+  });
+
+  describe("2. Stale valid lease recovery", () => {
+    it("reclaims slot when recorded owner process is dead", async () => {
+      const recordedIdentity = {
+        pid: 7100,
+        creationTime: "2026-09-07T09:00:00.000Z",
+        executable: "C:\\node.exe",
+        commandLine: "node worker.js",
+      };
+
+      // Mock probe: process not running (empty output)
+      const mockRunner = async ({ command }) => {
+        if (command === "powershell.exe") {
+          return { exitCode: 0, stdout: "", stderr: "" };
+        }
+        return { exitCode: 0, stdout: "", stderr: "" };
+      };
+
+      const supervisor = new WindowsProcessSupervisor({
+        commandRunner: mockRunner,
+        platform: "win32",
+      });
+
+      await acquireSlot({
+        stateRoot: tmpRoot,
+        jobId: "job-dead",
+        attemptId: "att-dead",
+        processIdentity: recordedIdentity,
+        processSupervisor: supervisor,
+      });
+
+      const reclaimResult = await reclaimLeases({
+        stateRoot: tmpRoot,
+        processSupervisor: supervisor,
+      });
+
+      assert.equal(reclaimResult.reclaimed.length, 1, "Dead owner lease must be reclaimed");
+      assert.equal(reclaimResult.reclaimed[0].reason, "dead_owner");
+      assert.equal(reclaimResult.reclaimed[0].slotId, 0);
+
+      // Verify slot is now available
+      const available = await getAvailableCount({
+        stateRoot: tmpRoot,
+        processSupervisor: supervisor,
+      });
+      assert.equal(available, DEFAULT_MAX_SLOTS);
+    });
+
+    it("reclaims slot when active owner identity matches but lease has exceeded stale timeout", async () => {
+      const taskkillCalls = [];
+      const recordedIdentity = {
+        pid: 7200,
+        creationTime: "2026-09-07T09:00:00.000Z",
+        executable: "C:\\Program Files\\nodejs\\node.exe",
+        commandLine: "node worker.js",
+      };
+
+      let processAlive = true;
+      const mockRunner = async ({ command, args }) => {
+        if (command === "powershell.exe") {
+          if (!processAlive) {
+            return { exitCode: 0, stdout: "", stderr: "" };
+          }
+          return {
+            exitCode: 0,
+            stdout: JSON.stringify({
+              ProcessId: 7200,
+              CreationDate: "2026-09-07T09:00:00.000Z",
+              ExecutablePath: "C:\\Program Files\\nodejs\\node.exe",
+              CommandLine: "node worker.js",
+            }),
+            stderr: "",
+          };
+        }
+        if (command === "taskkill") {
+          taskkillCalls.push({ command, args });
+          processAlive = false; // Taskkill terminates it
+          return { exitCode: 0, stdout: "SUCCESS", stderr: "" };
+        }
+        return { exitCode: 0, stdout: "", stderr: "" };
+      };
+
+      const supervisor = new WindowsProcessSupervisor({
+        commandRunner: mockRunner,
+        platform: "win32",
+      });
+
+      // Acquire slot with an acquiredAt timestamp 1 hour in the past
+      const slotsDir = path.join(tmpRoot, "locks", "slots");
+      await fsp.mkdir(slotsDir, { recursive: true });
+      const staleLease = {
+        slotId: 0,
+        jobId: "job-stale",
+        attemptId: "att-stale",
+        pid: 7200,
+        creationTime: recordedIdentity.creationTime,
+        executable: recordedIdentity.executable,
+        commandLine: recordedIdentity.commandLine,
+        acquiredAt: new Date(Date.now() - 3600_000).toISOString(),
+      };
+      await fsp.writeFile(
+        path.join(slotsDir, "slot-0.json"),
+        JSON.stringify(staleLease, null, 2),
+        "utf8"
+      );
+
+      const reclaimResult = await reclaimLeases({
+        stateRoot: tmpRoot,
+        staleTimeoutMs: 60_000,
+        processSupervisor: supervisor,
+      });
+
+      assert.equal(reclaimResult.reclaimed.length, 1, "Stale valid lease must be reclaimed");
+      assert.equal(reclaimResult.reclaimed[0].reason, "stale_owner_reclaimed");
+      assert.equal(taskkillCalls.length, 1, "taskkill must be verified and executed");
+      assert.deepEqual(taskkillCalls[0].args, ["/PID", "7200", "/T", "/F"]);
+
+      // Verify slot file unlinked
+      await assert.rejects(fsp.stat(path.join(slotsDir, "slot-0.json")), { code: "ENOENT" });
+    });
+  });
+
+  describe("3. Four-slot contention and exhaustion", () => {
+    it("enforces max default 4 slots, rejects 5th, and allows acquire after release", async () => {
+      const manager = new SlotLeaseManager({
+        stateRoot: tmpRoot,
+        maxSlots: 4,
+      });
+
+      const identities = [
+        { pid: 8001, creationTime: new Date().toISOString(), executable: "node.exe", commandLine: "node 1" },
+        { pid: 8002, creationTime: new Date().toISOString(), executable: "node.exe", commandLine: "node 2" },
+        { pid: 8003, creationTime: new Date().toISOString(), executable: "node.exe", commandLine: "node 3" },
+        { pid: 8004, creationTime: new Date().toISOString(), executable: "node.exe", commandLine: "node 4" },
+      ];
+
+      // Acquire 4 slots
+      for (let i = 0; i < 4; i += 1) {
+        const res = await manager.acquire({
+          jobId: `job-${i}`,
+          attemptId: `att-${i}`,
+          processIdentity: identities[i],
+        });
+        assert.equal(res.acquired, true);
+        assert.equal(res.slotId, i);
+      }
+
+      // Counts: 4 active, 0 available
+      assert.equal(await manager.getAvailableCount(), 0);
+
+      // Attempt 5th acquisition -> Contention exhaustion
+      const fifthAttempt = await manager.acquire({
+        jobId: "job-5",
+        attemptId: "att-5",
+        processIdentity: {
+          pid: 8005,
+          creationTime: new Date().toISOString(),
+          executable: "node.exe",
+          commandLine: "node 5",
+        },
+      });
+
+      assert.equal(fifthAttempt.acquired, false, "5th slot must be rejected");
+      assert.equal(fifthAttempt.reason, "slots_exhausted");
+
+      // Release slot 1
+      const releaseRes = await manager.release({ slotId: 1, jobId: "job-1", attemptId: "att-1" });
+      assert.equal(releaseRes.released, true);
+      assert.equal(await manager.getAvailableCount(), 1);
+
+      // Acquire again for job-5 -> should succeed and acquire slot 1
+      const retryFifth = await manager.acquire({
+        jobId: "job-5",
+        attemptId: "att-5",
+        processIdentity: {
+          pid: 8005,
+          creationTime: new Date().toISOString(),
+          executable: "node.exe",
+          commandLine: "node 5",
+        },
+      });
+
+      assert.equal(retryFifth.acquired, true);
+      assert.equal(retryFifth.slotId, 1);
+      assert.equal(await manager.getAvailableCount(), 0);
+    });
+  });
+
+  describe("4. Cancellation ordering", () => {
+    it("executes: marker writing -> graceful signal -> bounded wait -> verified force kill -> verify exit", async () => {
+      const events = [];
+      const markerPath = path.join(tmpRoot, "markers", "cancel.json");
+      const recordedIdentity = {
+        pid: 9100,
+        creationTime: "2026-09-07T12:00:00.000Z",
+        executable: "C:\\Program Files\\nodejs\\node.exe",
+        commandLine: "node worker.js",
+      };
+
+      let killed = false;
+      const mockRunner = async ({ command, args }) => {
+        if (command === "powershell.exe") {
+          if (killed) {
+            return { exitCode: 0, stdout: "", stderr: "" }; // Gone after taskkill
+          }
+          return {
+            exitCode: 0,
+            stdout: JSON.stringify({
+              ProcessId: 9100,
+              CreationDate: "2026-09-07T12:00:00.000Z",
+              ExecutablePath: "C:\\Program Files\\nodejs\\node.exe",
+              CommandLine: "node worker.js",
+            }),
+            stderr: "",
+          };
+        }
+        if (command === "taskkill") {
+          killed = true;
+          return { exitCode: 0, stdout: "SUCCESS", stderr: "" };
+        }
+        return { exitCode: 0, stdout: "", stderr: "" };
+      };
+
+      const res = await terminateProcess({
+        pid: 9100,
+        identity: recordedIdentity,
+        cancellationMarkerPath: markerPath,
+        gracePeriodMs: 60,
+        pollIntervalMs: 15,
+        commandRunner: mockRunner,
+        platform: "win32",
+        events,
+      });
+
+      assert.equal(res.stopped, true);
+      assert.equal(res.method, "force_tree_kill");
+
+      // Verify cancellation marker on disk
+      const markerContent = await readCancellationMarker(markerPath);
+      assert.ok(markerContent, "Cancellation marker file must exist");
+      assert.equal(markerContent.pid, 9100);
+      assert.equal(markerContent.action, "terminate");
+
+      // Verify exact event ordering
+      const eventTypes = events.map((e) => e.type);
+      assert.deepEqual(eventTypes, [
+        "cancellation_marker_written",
+        "graceful_signal_sent",
+        "force_tree_kill_initiated",
+        "force_kill_verified",
+      ]);
+    });
+  });
+
+  describe("5. Orphan classification", () => {
+    it("classifies active worker whose controller process died as orphan", async () => {
+      const recordedIdentity = {
+        pid: 9200,
+        creationTime: "2026-09-07T12:00:00.000Z",
+        executable: "C:\\node.exe",
+        commandLine: "node worker.js",
+      };
+
+      // Worker 9200 is alive; Controller 9199 is dead (empty probe)
+      const mockRunner = async ({ command, args }) => {
+        if (command === "powershell.exe") {
+          const script = args[3] || "";
+          if (script.includes("ProcessId = 9200")) {
+            return {
+              exitCode: 0,
+              stdout: JSON.stringify({
+                ProcessId: 9200,
+                CreationDate: "2026-09-07T12:00:00.000Z",
+                ExecutablePath: "C:\\node.exe",
+                CommandLine: "node worker.js",
+              }),
+              stderr: "",
+            };
+          }
+          if (script.includes("ProcessId = 9199")) {
+            return { exitCode: 0, stdout: "", stderr: "" }; // Controller dead
+          }
+        }
+        return { exitCode: 0, stdout: "", stderr: "" };
+      };
+
+      const supervisor = new WindowsProcessSupervisor({
+        commandRunner: mockRunner,
+        platform: "win32",
+      });
+
+      const lease = {
+        slotId: 0,
+        jobId: "job-orphan",
+        attemptId: "att-orphan",
+        pid: 9200,
+        controllerPid: 9199,
+        creationTime: recordedIdentity.creationTime,
+        executable: recordedIdentity.executable,
+        commandLine: recordedIdentity.commandLine,
+        acquiredAt: new Date().toISOString(),
+      };
+
+      const classification = await classifyLease(lease, { processSupervisor: supervisor });
+      assert.equal(classification.status, "orphan");
+      assert.equal(classification.reason, "controller_dead");
+      assert.equal(classification.controllerPid, 9199);
+    });
+
+    it("detects running worker processes without active leases as orphan processes", async () => {
+      const recordedIdentity = {
+        pid: 9500,
+        creationTime: "2026-09-07T12:00:00.000Z",
+        executable: "node.exe",
+        commandLine: "node worker.js",
+      };
+
+      const mockRunner = async ({ command, args }) => {
+        if (command === "powershell.exe") {
+          const script = args?.[3] || "";
+          if (script.includes("ProcessId = 9500")) {
+            return {
+              exitCode: 0,
+              stdout: JSON.stringify({
+                ProcessId: 9500,
+                CreationDate: recordedIdentity.creationTime,
+                ExecutablePath: recordedIdentity.executable,
+                CommandLine: recordedIdentity.commandLine,
+              }),
+              stderr: "",
+            };
+          }
+        }
+        return { exitCode: 0, stdout: "", stderr: "" };
+      };
+
+      const supervisor = new WindowsProcessSupervisor({
+        commandRunner: mockRunner,
+        platform: "win32",
+      });
+
+      const manager = new SlotLeaseManager({
+        stateRoot: tmpRoot,
+        maxSlots: 4,
+        processSupervisor: supervisor,
+      });
+
+      // Acquire slot 0 for PID 9500
+      await manager.acquire({
+        jobId: "job-leased",
+        attemptId: "att-leased",
+        processIdentity: recordedIdentity,
+      });
+
+      const runningProcesses = [
+        { pid: 9500, name: "node.exe" },
+        { pid: 9501, name: "node.exe" }, // Orphan: no lease held!
+      ];
+
+      const orphans = await manager.detectOrphanProcesses(runningProcesses);
+      assert.equal(orphans.length, 1);
+      assert.equal(orphans[0].pid, 9501);
+      assert.equal(orphans[0].reason, "running_without_active_lease");
+    });
+  });
+
+  describe("6. Process spawn without shell interpolation", () => {
+    it("spawns a detached process without shell command interpolation", async () => {
+      const spawned = await spawnDetachedWorker({
+        command: process.execPath,
+        args: ["-e", "process.exit(0)"],
+        windowsHide: true,
+      });
+
+      assert.ok(spawned.pid > 0, "Spawned process must have valid PID");
+      assert.equal(spawned.identity.pid, spawned.pid);
+      assert.equal(spawned.identity.executable, process.execPath);
+      assert.ok(spawned.identity.creationTime);
+    });
+  });
+
+  describe("7. Identity validation and normalization unit checks", () => {
+    it("handles Windows case-insensitive path comparisons and date formats", () => {
+      const recorded = {
+        pid: 1234,
+        creationTime: "2026-09-07T14:17:58.626Z",
+        executable: "c:\\program files\\nodejs\\node.exe",
+        commandLine: '"C:\\Program Files\\nodejs\\node.exe" script.js',
+      };
+
+      const live = {
+        pid: 1234,
+        creationTime: "/Date(1788790678626)/",
+        executable: "C:\\PROGRAM FILES\\NODEJS\\NODE.EXE",
+        commandLine: 'C:\\Program Files\\nodejs\\node.exe script.js',
+      };
+
+      const validation = validateProcessIdentity(recorded, live, { platform: "win32" });
+      assert.equal(validation.matches, true);
+    });
+
+    it("rejects mismatched command line", () => {
+      const recorded = {
+        pid: 1234,
+        creationTime: "2026-09-07T14:17:58.626Z",
+        executable: "node.exe",
+        commandLine: "node target-script.js",
+      };
+
+      const live = {
+        pid: 1234,
+        creationTime: "2026-09-07T14:17:58.626Z",
+        executable: "node.exe",
+        commandLine: "node entirely-different-script.js",
+      };
+
+      const validation = validateProcessIdentity(recorded, live, { platform: "win32" });
+      assert.equal(validation.matches, false);
+      assert.equal(validation.reason, "command_line_mismatch");
+    });
+  });
+});

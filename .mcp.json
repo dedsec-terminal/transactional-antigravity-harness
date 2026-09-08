@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "agy": {
+      "title": "Antigravity CLI",
+      "description": "Delegate bounded tasks to the local Google Antigravity CLI.",
+      "cwd": ".",
+      "command": "node",
+      "args": [
+        "./mcp/dist/server.cjs"
+      ]
+    }
+  }
+}

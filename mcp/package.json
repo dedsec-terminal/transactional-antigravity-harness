@@ -1,0 +1,25 @@
+{
+  "name": "@illejivin/agy-mcp-server",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "esbuild src/index.ts --bundle --minify --platform=node --format=cjs --target=node20 --outfile=dist/server.cjs",
+    "check": "tsc --noEmit",
+    "test": "node test/ledger-outbox.mjs && node test/process-leases.mjs && node test/contracts.mjs && node test/git-artifacts.mjs && node test/runner-controller.mjs && node test/smoke.mjs && node test/deterministic.mjs",
+    "test:protocol": "node test/smoke.mjs --protocol-only"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/server": "2.0.0",
+    "zod": "4.4.3"
+  },
+  "devDependencies": {
+    "@modelcontextprotocol/client": "2.0.0",
+    "@types/node": "24.10.1",
+    "esbuild": "0.28.1",
+    "typescript": "5.9.3"
+  }
+}
