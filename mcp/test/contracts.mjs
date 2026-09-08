@@ -2,6 +2,8 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import path from "node:path";
 import os from "node:os";
+import fsp from "node:fs/promises";
+import { fileURLToPath } from "node:url";
 
 import {
   ISOLATION_SHARED,
@@ -406,4 +408,81 @@ test("Callback exact lines: three-line callback builder showing all 6 required f
   });
   const injectedLines = injected.split("\n");
   assert.equal(injectedLines.length, 3, "Must sanitize multiline inputs into single lines");
+});
+
+test("Protocol contract: sparseCheckout schema, description, handler forwarding, and runner serialization", async () => {
+  const here = path.dirname(fileURLToPath(import.meta.url));
+  const indexPath = path.resolve(here, "../src/index.ts");
+  const content = await fsp.readFile(indexPath, "utf8");
+
+  // RunnerInput contract
+  assert.match(
+    content,
+    /type\s+RunnerInput\s*=\s*\{[\s\S]*?sparseCheckout\?:\s*boolean;?[\s\S]*?\};/,
+    "RunnerInput must define optional sparseCheckout boolean",
+  );
+
+  // Schema contract in delegateSchema
+  assert.match(
+    content,
+    /sparseCheckout:\s*z\.boolean\(\)\.optional\(\)\.describe\(/,
+    "delegateSchema must define sparseCheckout as z.boolean().optional() with description",
+  );
+
+  // Required explanations in description
+  const descMatch = content.match(/sparseCheckout:\s*z\.boolean\(\)\.optional\(\)\.describe\(\s*([\s\S]*?)\s*\),/);
+  assert.ok(descMatch, "sparseCheckout description must exist");
+  const desc = descMatch[1];
+  assert.match(desc, /checks out only declared targets in cone mode/i);
+  assert.match(desc, /includes root\/ancestor\/same-directory files/i);
+  assert.match(desc, /requires targets exist at base/i);
+  assert.match(desc, /full default for dependencies\/new paths/i);
+
+  // Both handlers must expose and forward sparseCheckout
+  assert.match(
+    content,
+    /server\.registerTool\(\s*['"]agy_delegate['"][\s\S]*?async\s*\(\{[^}]*sparseCheckout[^}]*\}\)/,
+    "agy_delegate handler must receive sparseCheckout",
+  );
+  assert.match(
+    content,
+    /server\.registerTool\(\s*['"]agy_delegate_async['"][\s\S]*?async\s*\(\{[^}]*sparseCheckout[^}]*\}\)/,
+    "agy_delegate_async handler must receive sparseCheckout",
+  );
+
+  // Both handlers must forward sparseCheckout to delegateArgs
+  const delegateMatches = [...content.matchAll(/delegateArgs\(\s*\{[\s\S]*?sparseCheckout[\s\S]*?\}\s*,\s*promptFile\.file\s*\)/g)];
+  assert.equal(delegateMatches.length, 2, "delegateArgs must be called with sparseCheckout in both handlers");
+
+  // Serialization to runner: serialize as --sparse-checkout only when true
+  assert.match(
+    content,
+    /if\s*\(\s*input\.sparseCheckout\s*===\s*true\s*\)\s*args\.push\(['"]--sparse-checkout['"]\);/,
+    "delegateArgs must push --sparse-checkout only when input.sparseCheckout is strictly true",
+  );
+
+  // Behavioral verification of argument serialization contract
+  function simulateDelegateArgs(input) {
+    const args = [];
+    if (input.targets?.length) args.push("--targets-json", JSON.stringify(input.targets));
+    if (input.sparseCheckout === true) args.push("--sparse-checkout");
+    if (input.isolation) args.push("--isolation", input.isolation);
+    return args;
+  }
+
+  assert.deepEqual(
+    simulateDelegateArgs({ sparseCheckout: true }),
+    ["--sparse-checkout"],
+    "Must serialize --sparse-checkout when true",
+  );
+  assert.deepEqual(
+    simulateDelegateArgs({ sparseCheckout: false }),
+    [],
+    "Must not serialize --sparse-checkout when false",
+  );
+  assert.deepEqual(
+    simulateDelegateArgs({}),
+    [],
+    "Must not serialize --sparse-checkout when omitted (default false)",
+  );
 });

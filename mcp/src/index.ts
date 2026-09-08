@@ -29,7 +29,7 @@ type PromptFile = {
   file: string;
 };
 
-type DelegateInput = {
+export type RunnerInput = {
   prompt: string;
   cwd: string;
   mode: 'plan' | 'accept-edits';
@@ -38,11 +38,14 @@ type DelegateInput = {
   agent?: string;
   model?: string;
   targets?: string[];
+  sparseCheckout?: boolean;
   isolation?: 'worktree' | 'shared';
   resumeJobId?: string;
   retentionMinutes?: number;
   jobId?: string;
 };
+
+export type DelegateInput = RunnerInput;
 
 function pluginRoot(): string {
   const packageRoot = path.resolve(path.dirname(process.argv[1]), '..');
@@ -162,6 +165,7 @@ function delegateArgs(input: DelegateInput, promptFile: string): string[] {
   if (input.agent) args.push('--agent', input.agent);
   if (input.model) args.push('--model', input.model);
   if (input.targets?.length) args.push('--targets-json', JSON.stringify(input.targets));
+  if (input.sparseCheckout === true) args.push('--sparse-checkout');
   if (input.isolation) args.push('--isolation', input.isolation);
   if (input.resumeJobId) args.push('--resume-job-id', input.resumeJobId);
   if (input.retentionMinutes !== undefined) args.push('--retention-minutes', String(input.retentionMinutes));
@@ -199,6 +203,9 @@ const delegateSchema = {
   agent: z.string().min(1).max(200).optional(),
   model: z.string().min(1).max(200).optional(),
   targets: z.array(z.string().min(1).max(1000)).max(1000).optional(),
+  sparseCheckout: z.boolean().optional().describe(
+    'Checks out only declared targets in cone mode, includes root/ancestor/same-directory files, requires targets exist at base, full default for dependencies/new paths.',
+  ),
   isolation: z.enum(['worktree', 'shared']).optional(),
   resumeJobId: z.string().min(1).max(200).optional(),
   retentionMinutes: z.number().int().min(10).max(10080).optional(),
@@ -266,7 +273,7 @@ function createServer(): McpServer {
         idempotentHint: false,
       },
     },
-    async ({ prompt, cwd, mode, outputFormat, timeoutSeconds, agent, model, targets, isolation, resumeJobId, retentionMinutes }) => {
+    async ({ prompt, cwd, mode, outputFormat, timeoutSeconds, agent, model, targets, sparseCheckout, isolation, resumeJobId, retentionMinutes }) => {
       if (!(await runnerAvailable())) return failure(`Antigravity runner was not found at: ${runnerPath()}`);
       let resolvedCwd: string;
       try {
@@ -280,7 +287,7 @@ function createServer(): McpServer {
       const promptFile = await createPromptFile(prompt);
       try {
         const args = delegateArgs(
-          { prompt, cwd: resolvedCwd, mode, outputFormat, timeoutSeconds, agent, model, targets, isolation, resumeJobId, retentionMinutes, jobId },
+          { prompt, cwd: resolvedCwd, mode, outputFormat, timeoutSeconds, agent, model, targets, sparseCheckout, isolation, resumeJobId, retentionMinutes, jobId },
           promptFile.file,
         );
         const result = await runProcess(
@@ -338,7 +345,7 @@ function createServer(): McpServer {
         idempotentHint: false,
       },
     },
-    async ({ prompt, cwd, mode, outputFormat, timeoutSeconds, agent, model, targets, isolation, resumeJobId, retentionMinutes, notifyThread }) => {
+    async ({ prompt, cwd, mode, outputFormat, timeoutSeconds, agent, model, targets, sparseCheckout, isolation, resumeJobId, retentionMinutes, notifyThread }) => {
       if (!(await runnerAvailable())) return failure(`Antigravity runner was not found at: ${runnerPath()}`);
       let resolvedCwd: string;
       try {
@@ -359,7 +366,7 @@ function createServer(): McpServer {
       const jobId = resumeJobId || randomUUID();
       const promptFile = await createPromptFile(prompt);
       const args = delegateArgs(
-        { prompt, cwd: resolvedCwd, mode, outputFormat, timeoutSeconds, agent, model, targets, isolation, resumeJobId, retentionMinutes, jobId },
+        { prompt, cwd: resolvedCwd, mode, outputFormat, timeoutSeconds, agent, model, targets, sparseCheckout, isolation, resumeJobId, retentionMinutes, jobId },
         promptFile.file,
       );
       args.push('--notify-thread', notifyThread, '--cleanup-prompt-file', '--async');

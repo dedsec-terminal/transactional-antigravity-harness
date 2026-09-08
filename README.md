@@ -54,7 +54,7 @@ flowchart TD
 * **Dual Execution Modes**:
   * **Synchronous (`agy_delegate`)**: Quick turnaround for bounded single-file edits, reviews, or plans.
   * **Asynchronous (`agy_delegate_async`)**: Background task dispatch with reactive completion notification via `codex queue` to avoid busy-polling.
-* **Transactional Worktree Isolation**: Mutating tasks (`accept-edits`) run in isolated ephemeral git worktrees by default (`isolation: "worktree"`). Canonical repository files remain clean until changes are validated.
+* **Transactional Worktree Isolation**: Mutating tasks (`accept-edits`) run in isolated ephemeral git worktrees by default (`isolation: "worktree"`), with optional Git cone sparse checkout (`sparseCheckout: true`, CLI `--sparse-checkout`). Canonical repository files remain clean until changes are validated.
 * **Bounded Parallel Fan-out**: Up to 4 parallel workers (`MAX_WORKER_SLOTS = 4`) targeting non-overlapping file paths or directory prefixes.
 * **Windows & POSIX Process Stability**: Stdin NDJSON prompt delivery avoids Windows command-line character limits. Process tree teardowns use `taskkill /PID /T /F` on Windows and `SIGTERM` process groups on POSIX.
 * **Complete Job Lifecycle Management (`agy_job`)**: Inspect job status, list attempts, cancel active workers, reconcile stale leases, and explicitly apply or finalize changes.
@@ -106,7 +106,7 @@ flowchart TD
 
 * **Disk & Context Isolation**: Combines disk-isolated checkouts ([Cursor Worktrees](https://cursor.com/docs/configuration/worktrees)) and separate focused context windows ([Claude Code Sub-agents](https://code.claude.com/docs/en/sub-agents)) with hash-verified artifact validation.
 * **Grounded Performance**: Worktree creation involves standard OS filesystem operations rather than "zero I/O". There are no guaranteed speedups, token savings, or delivery guarantees; operational benefits depend on task decomposition and parallel execution.
-* **Engineering Guardrails**: Opt-in sparse checkout remains an experimental proposal pending verification (with no guarantee that all source is required for all checks); durable disk ledgers are retained for crash safety and reconciliation without RAM-only defaults or failover authority expansion; and the MCP embedded controller is deferred until empirical measurements justify lifecycle changes.
+* **Engineering Guardrails**: Opt-in sparse checkout (`sparseCheckout: true`, CLI `--sparse-checkout`) is implemented using Git cone mode; full checkout remains the default. Selecting a tracked file expands to parent directory siblings; root files are present, and unrelated subtrees are absent. Targets must exist at base commit, so callers creating new files must target an existing parent directory. Sparse checkout is recommended only for bounded self-contained edits; full checkout remains recommended for repo-wide or cross-module checks. Measured speedup is not yet claimed. Durable disk ledgers are retained for crash safety and reconciliation without RAM-only defaults or failover authority expansion; and the MCP embedded controller is deferred until empirical measurements justify lifecycle changes.
 
 ---
 
@@ -236,6 +236,7 @@ Synchronously delegates a bounded task to Antigravity and waits for the result.
 * `mode` (`"plan"` | `"accept-edits"`, default `"accept-edits"`): Task execution mode.
 * `targets` (string[], optional): Array of workspace-relative paths or directory prefixes assigned to this worker.
 * `isolation` (`"worktree"` | `"shared"`, optional): Defaults to `"worktree"` for mutating edits; `"shared"` is only permitted for `"plan"`.
+* `sparseCheckout` (boolean, optional, default `false`): Explicit opt-in for Git cone sparse worktree checkout. Restricts checkout to directories of specified `targets` plus root files while omitting unrelated subtrees. Cone behavior: selected tracked file expands to parent directory siblings; root files present; unrelated subtrees absent. Targets must exist at base commit (use existing parent directory target when creating new files). Recommended only for bounded self-contained edits; full checkout is recommended for cross-module checks. Measured speedup is not yet claimed.
 * `timeoutSeconds` (number, default `300`): Execution timeout (1–1800s). Sizing target is under 25s.
 * `outputFormat` (`"text"` | `"json"`, default `"text"`): Desired output structure.
 * `resumeJobId` (string, optional): Resume a prior job attempt in its existing worktree.
@@ -245,6 +246,7 @@ Synchronously delegates a bounded task to Antigravity and waits for the result.
   "cwd": "/path/to/workspace",
   "mode": "accept-edits",
   "targets": ["src/parser/"],
+  "sparseCheckout": true,
   "prompt": "Add unit tests for escape sequence edge cases in token parsing.",
   "timeoutSeconds": 300,
   "outputFormat": "text"
@@ -293,7 +295,7 @@ Inspects or manages the lifecycle of transactional jobs.
 The bundled runner can be invoked directly from the command line:
 
 ```text
-Usage: agy-delegate.mjs --check | --job-action ACTION [--job-args-json JSON] | --cwd PATH --prompt-file PATH [--targets-json JSON] [--mode plan|accept-edits] [--isolation shared|worktree] [--resume-job-id ID] [--notify-thread ID --async]
+Usage: agy-delegate.mjs --check | --job-action ACTION [--job-args-json JSON] | --cwd PATH --prompt-file PATH [--targets-json JSON] [--mode plan|accept-edits] [--isolation shared|worktree] [--sparse-checkout] [--resume-job-id ID] [--notify-thread ID --async]
 ```
 
 ### Examples
@@ -309,6 +311,16 @@ Usage: agy-delegate.mjs --check | --job-action ACTION [--job-args-json JSON] | -
     --prompt-file /path/to/prompt.md \
     --mode accept-edits \
     --targets-json '["src/index.ts"]' \
+    --timeout-seconds 300
+  ```
+* **Synchronous run with sparse checkout**:
+  ```bash
+  node skills/delegate-to-antigravity/scripts/agy-delegate.mjs \
+    --cwd /path/to/workspace \
+    --prompt-file /path/to/prompt.md \
+    --mode accept-edits \
+    --targets-json '["src/index.ts"]' \
+    --sparse-checkout \
     --timeout-seconds 300
   ```
 * **Asynchronous run**:

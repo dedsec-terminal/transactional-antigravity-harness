@@ -32,6 +32,7 @@ Transactional execution isolates mutations and tracks execution state:
   - Synchronous `plan`: defaults to `shared` isolation.
   - Asynchronous execution or mutating `accept-edits`: defaults to `worktree` isolation.
   - Explicit `shared` isolation for mutating (`accept-edits`) or `async` tasks is rejected as an unsafe combination.
+- **Sparse checkout (`sparseCheckout`, default `false`):** Explicit opt-in for Git cone sparse worktree checkout (CLI `--sparse-checkout`; default is full checkout). Cone behavior: selecting a tracked file expands to its parent directory siblings; root files are present; unrelated subtrees are absent. Targets must exist at base commit, so use an existing parent directory target when creating new files. Recommend only for bounded self-contained edits; prefer full checkout for repo-wide or cross-module checks. Measured speedup is not yet claimed. Safety caveat: omitting unrelated subtrees can break cross-module type checking, imports, or repo-wide test suites if unselected dependencies are required.
 - **Four concurrency slots:** Harness limits active workers to four concurrent slots (`MAX_WORKER_SLOTS = 4`) to prevent workspace and CPU exhaustion.
 - **Explicit apply/finalize:** Worker changes produced in a worktree are staged in isolation. The parent orchestrator inspects the diff/artifact and must explicitly apply or finalize changes. No changes are merged automatically.
 - **Job resumption (`resumeJobId`) & No `--continue`:** Headless transactional execution does not use `--continue` or `--resume`. To continue correction work, provide `resumeJobId`; the harness validates the exact recorded worktree/session and invokes AGY with `--conversation <recorded-id>` for immutable attempt N+1.
@@ -71,6 +72,7 @@ agy_delegate({
   cwd: "<absolute-workspace>",
   mode: "accept-edits",
   targets: ["<workspace-relative-file-or-directory-prefix>"],
+  sparseCheckout: true, // optional: cone sparse checkout (default false)
   prompt: "<bounded task with disjoint ownership>",
   timeoutSeconds: 300,
   outputFormat: "text"
@@ -85,24 +87,25 @@ agy_delegate_async({
   notifyThread: "<current-thread-id>",
   mode: "accept-edits",
   targets: ["<workspace-relative-file-or-directory-prefix>"],
+  sparseCheckout: true, // optional: cone sparse checkout (default false)
   prompt: "<bounded task>",
   timeoutSeconds: 300,
   outputFormat: "text"
 })
 ```
 
-Supported modes are `plan` and `accept-edits`; the default is `accept-edits`. The accepted timeout range is 1–1800 seconds, but normal delegated work must use 180–300 seconds. Optional transactional parameters include `targets` (list of paths/prefixes), `isolation` (`worktree` | `shared`), `resumeJobId` (job ID to resume), and `retentionMinutes` (defaults to 1440 for 24h worktree retention).
+Supported modes are `plan` and `accept-edits`; the default is `accept-edits`. The accepted timeout range is 1–1800 seconds, but normal delegated work must use 180–300 seconds. Optional transactional parameters include `targets` (list of paths/prefixes), `isolation` (`worktree` | `shared`), `sparseCheckout` (boolean, default `false`, opt-in Git cone sparse checkout), `resumeJobId` (job ID to resume), and `retentionMinutes` (defaults to 1440 for 24h worktree retention). Safety caveat: `sparseCheckout` omits unselected subtrees; use only for self-contained edits and prefer full checkout for repo-wide or cross-module verification.
 
 ## Bundled runner
 
 ```text
-node <skill-dir>/scripts/agy-delegate.mjs --cwd <absolute-workspace> --mode accept-edits --targets-json '["src/file.ts"]' --prompt-file <absolute-prompt-file> --timeout-seconds 300 --output-format text
+node <skill-dir>/scripts/agy-delegate.mjs --cwd <absolute-workspace> --mode accept-edits --targets-json '["src/file.ts"]' [--sparse-checkout] --prompt-file <absolute-prompt-file> --timeout-seconds 300 --output-format text
 ```
 
 Asynchronous callback:
 
 ```text
-node <skill-dir>/scripts/agy-delegate.mjs --cwd <absolute-workspace> --mode accept-edits --targets-json '["src/file.ts"]' --prompt-file <absolute-prompt-file> --timeout-seconds 300 --notify-thread <thread-id> --async
+node <skill-dir>/scripts/agy-delegate.mjs --cwd <absolute-workspace> --mode accept-edits --targets-json '["src/file.ts"]' [--sparse-checkout] --prompt-file <absolute-prompt-file> --timeout-seconds 300 --notify-thread <thread-id> --async
 ```
 
 Delete caller-owned prompt files after completion. MCP-owned temporary prompt files are deleted by the background worker.
