@@ -2,14 +2,23 @@ import fsp from "node:fs/promises";
 import path from "node:path";
 
 import { resolveAgyRoot, ensureDir, generateUuid, sha256, sha256Json, writeJsonAtomic, readJson } from "./storage.mjs";
-import { createJob, createAttempt, getJob, getAttempt, getAttemptDir, listAttempts, updateJobState, updateAttemptState, sealAttempt, checkStorageHealth } from "./ledger.mjs";
+import { createJob, createAttempt, getJob, getAttempt, getAttemptDir, getJobDir, listAttempts, updateJobState, updateAttemptState, sealAttempt, checkStorageHealth } from "./ledger.mjs";
 import { DEFAULT_RETENTION_MINUTES, TYPED_RESULT_SCHEMA, buildFourPillarPrompt, buildCallbackMessage, normalizeTargets, parseTypedResult, resolveIsolation } from "./contracts.mjs";
 import { enqueueOutboxRecord, getPendingOutboxRecords, listOutboxRecords, recordOutboxFailure, recordOutboxSuccess } from "./outbox.mjs";
-import { acquireSlot, getCounts, reclaimLeases, releaseSlot } from "./leases.mjs";
+import { acquireSlot, activateReservedSlot, getActiveCount, getCounts, reclaimLeases, releaseSlot, reserveSlot } from "./leases.mjs";
+import { sampleSystemCapacity, recommendWorkerCapacity } from "./system-capacity.mjs";
+import { appendActivityEvent } from "./activity.mjs";
 import { createWorktree, finalizeWorktree, validateRepository, verifyWorktreeOwnership } from "./git-worktree.mjs";
 import { captureEvidence } from "./evidence.mjs";
 import { applyPatch } from "./apply.mjs";
 import { terminateProcess } from "./windows-process.mjs";
+
+async function appendJobActivity(stateRoot, jobId, event) {
+  try {
+    const jobDir = getJobDir(stateRoot, jobId);
+    await appendActivityEvent(jobDir, event);
+  } catch {}
+}
 
 export const VERSION = "1.0.0";
 export const DEFAULT_TIMEOUT_SECONDS = 300;
@@ -161,6 +170,9 @@ export async function persistBeforeSpawn({ root, params = {}, now = Date.now() }
     }
   }
 
+  await appendJobActivity(stateRoot, job.jobId, { phase: "accepted" });
+  await appendJobActivity(stateRoot, job.jobId, { phase: "preparing" });
+
   const attemptId = generateUuid();
   const executionCwd = worktreePath ?? requestedCwd;
   const attempt = await createAttempt(stateRoot, job.jobId, { attemptId, attemptIndex, metadata: { isolation: config.isolation, worktreePath, executionCwd, repoRoot: repo?.repoRoot ?? null, repoIdentity: repo?.identity ?? null, baseSha: repo?.headSha ?? job.manifest.metadata?.baseSha ?? null, targets: config.targets, sparseCheckout: config.sparseCheckout, subagents: config.subagents, resumeSessionId } }, { now });
@@ -194,13 +206,142 @@ export function buildWorkerPrompt(request, promptText) {
 
 export function workerSchemaArgument() { return JSON.stringify(TYPED_RESULT_SCHEMA); }
 
-export async function recordWorkerSpawn(root, jobId, attemptId, identity) {
+export async function reserveWorker(root, jobId, attemptId, controllerIdentity, options = {}) {
   const stateRoot = resolveAgyRoot(root);
   const attemptDir = getAttemptDir(stateRoot, jobId, attemptId);
-  const lease = await acquireSlot({ stateRoot, jobId, attemptId, processIdentity: identity, controllerPid: process.pid, cancellationMarkerPath: path.join(attemptDir, "cancel.json") });
-  if (!lease.acquired) throw new Error("All four Antigravity worker slots are occupied");
-  await writeJsonAtomic(path.join(attemptDir, "worker.json"), { identity, slotId: lease.slotId, slotPath: lease.slotPath, recordedAt: new Date().toISOString() });
+  const activeWorkers = options.activeWorkers !== undefined
+    ? options.activeWorkers
+    : await (options.getActiveCount ?? getActiveCount)({ stateRoot, maxSlots: 8 });
+
+  const sampler = options.sampleSystemCapacity ?? sampleSystemCapacity;
+  const sample = typeof sampler === "function"
+    ? await sampler(options)
+    : (sampler && typeof sampler === "object" ? sampler : (options.sample ?? await sampleSystemCapacity(options)));
+
+  const recommender = options.recommendWorkerCapacity ?? recommendWorkerCapacity;
+  const capacity = recommender(sample, {
+    ...options,
+    env: options.env,
+    activeWorkers,
+  });
+
+  if (capacity.availableSlots <= 0) {
+    const error = new Error(`Capacity exhausted: no available worker slots (recommended: ${capacity.recommendedSlots}, active: ${capacity.activeWorkers})`);
+    error.code = "CAPACITY_EXHAUSTED";
+    error.capacity = capacity;
+    throw error;
+  }
+
+  const reserver = options.reserveSlot ?? reserveSlot;
+  const reservation = await reserver({
+    stateRoot,
+    jobId,
+    attemptId,
+    controllerProcessIdentity: controllerIdentity,
+    controllerPid: controllerIdentity?.pid ?? process.pid,
+    maxSlots: capacity.recommendedSlots,
+    cancellationMarkerPath: path.join(attemptDir, "cancel.json"),
+    ...options.reserveOptions,
+  });
+
+  if (!reservation?.acquired) {
+    const error = new Error("Capacity exhausted: unable to reserve worker slot");
+    error.code = "CAPACITY_EXHAUSTED";
+    error.capacity = capacity;
+    error.reservation = reservation;
+    throw error;
+  }
+
+  const workerRecord = {
+    phase: "reserved",
+    identity: controllerIdentity,
+    slotId: reservation.slotId,
+    slotPath: reservation.slotPath,
+    lease: reservation.lease,
+    nonce: reservation.lease?.nonce,
+    capacity,
+    reservedAt: new Date().toISOString(),
+  };
+  try {
+    await writeJsonAtomic(path.join(attemptDir, "worker.json"), workerRecord);
+  } catch (error) {
+    await releaseSlot({
+      stateRoot,
+      slotId: reservation.slotId,
+      slotPath: reservation.slotPath,
+      jobId,
+      attemptId,
+    }).catch(() => {});
+    throw error;
+  }
+
+  return {
+    ...reservation,
+    reservation,
+    capacity,
+  };
+}
+
+export async function recordWorkerSpawn(root, jobId, attemptId, identity, options = {}) {
+  const stateRoot = resolveAgyRoot(root);
+  const attemptDir = getAttemptDir(stateRoot, jobId, attemptId);
+  const workerPath = path.join(attemptDir, "worker.json");
+  let reservedWorker = null;
+  try {
+    reservedWorker = await readJson(workerPath);
+  } catch (error) {
+    if (error?.code !== "ENOENT") throw error;
+  }
+
+  let lease;
+  if (reservedWorker) {
+    const activator = options.activateReservedSlot ?? activateReservedSlot;
+    const activation = await activator({
+      stateRoot,
+      slotId: reservedWorker.slotId,
+      slotPath: reservedWorker.slotPath,
+      nonce: reservedWorker.nonce ?? reservedWorker.lease?.nonce,
+      jobId,
+      attemptId,
+      workerProcessIdentity: identity,
+      ...options.activationOptions,
+    });
+    if (!activation?.activated) {
+      throw new Error(`Failed to activate reserved worker slot: ${activation?.reason ?? "activation_failed"}`);
+    }
+    lease = { ...activation, acquired: true };
+    await writeJsonAtomic(workerPath, {
+      ...reservedWorker,
+      phase: "active",
+      identity,
+      slotId: activation.slotId,
+      slotPath: activation.slotPath,
+      lease: activation.lease,
+      recordedAt: new Date().toISOString(),
+    });
+  } else {
+    const acquirer = options.acquireSlot ?? acquireSlot;
+    lease = await acquirer({
+      stateRoot,
+      jobId,
+      attemptId,
+      processIdentity: identity,
+      controllerPid: process.pid,
+      cancellationMarkerPath: path.join(attemptDir, "cancel.json"),
+      ...options.acquireOptions,
+    });
+    if (!lease?.acquired) throw new Error("No Antigravity worker slots are available");
+    await writeJsonAtomic(workerPath, {
+      phase: "active",
+      identity,
+      slotId: lease.slotId,
+      slotPath: lease.slotPath,
+      lease: lease.lease,
+      recordedAt: new Date().toISOString(),
+    });
+  }
   await updateAttemptState(stateRoot, jobId, attemptId, { execution: "executing" });
+  await appendJobActivity(stateRoot, jobId, { phase: "running" });
   return lease;
 }
 
@@ -225,6 +366,7 @@ function executionState(result, protocolOkay) {
 export async function completeRun(root, jobId, attemptId, result) {
   const context = await getRunContext(root, jobId, attemptId);
   const { attempt, request } = context;
+  await appendJobActivity(context.root, jobId, { phase: "verifying" });
   await fsp.writeFile(path.join(attempt.attemptDir, "stdout.log"), result.stdout ?? "", "utf8");
   await fsp.writeFile(path.join(attempt.attemptDir, "stderr.log"), result.stderr ?? "", "utf8");
   let typedResult = null;
@@ -260,6 +402,7 @@ export async function completeRun(root, jobId, attemptId, result) {
   const lifecycle = execution === "cancelled" ? "cancelled" : execution === "succeeded" ? "completed" : "failed";
   await sealAttempt(context.root, jobId, attemptId, { lifecycle, execution, artifact: artifactState, parentVerification: "pending" });
   await updateJobState(context.root, jobId, { lastAttemptId: attemptId, lastExecution: execution, lastArtifact: artifactState });
+  await appendJobActivity(context.root, jobId, { phase: lifecycle });
   const callbackThread = request.callbackThread;
   let callback = null;
   if (callbackThread) {
