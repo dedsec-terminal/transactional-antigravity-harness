@@ -33,18 +33,21 @@ export const PUBLIC_FIELDS = new Set([
 ]);
 
 const ALLOWED_USAGE_KEYS = new Set(['inputTokens', 'outputTokens', 'totalTokens']);
+const FORBIDDEN_FIELDS = new Set(
+  Array.from(REJECTED_FIELDS, (f) => f.toLowerCase())
+);
 const pathLocks = new Map();
 
 function withPathLock(targetPath, fn) {
   const prev = pathLocks.get(targetPath) || Promise.resolve();
-  let release;
-  new Promise((resolve) => { release = resolve; });
-  const run = prev.catch(() => {}).then(fn);
-  pathLocks.set(targetPath, run.finally(() => {
-    if (pathLocks.get(targetPath) === run) pathLocks.delete(targetPath);
-    release?.();
-  }));
-  return run;
+  const current = prev.catch(() => {}).then(fn);
+  const cleanup = current.catch(() => {}).finally(() => {
+    if (pathLocks.get(targetPath) === cleanup) {
+      pathLocks.delete(targetPath);
+    }
+  });
+  pathLocks.set(targetPath, cleanup);
+  return current;
 }
 
 function normalizeString(val, maxLen) {
@@ -60,7 +63,7 @@ function validateAndSanitizeEvent(event) {
   }
 
   for (const key of Object.keys(event)) {
-    if (REJECTED_FIELDS.has(key) || REJECTED_FIELDS.has(key.toLowerCase())) {
+    if (FORBIDDEN_FIELDS.has(key.toLowerCase())) {
       throw new Error(`Prohibited field in activity event: "${key}"`);
     }
     if (!PUBLIC_FIELDS.has(key)) {
@@ -75,12 +78,18 @@ function validateAndSanitizeEvent(event) {
   let timestamp;
   if (event.timestamp === undefined) {
     timestamp = new Date().toISOString();
-  } else if (typeof event.timestamp === 'string') {
-    timestamp = normalizeString(event.timestamp, 64);
-  } else if (typeof event.timestamp === 'number' && Number.isFinite(event.timestamp)) {
-    timestamp = new Date(event.timestamp).toISOString();
+  } else if (
+    (typeof event.timestamp === 'string' && event.timestamp.trim().length > 0) ||
+    (typeof event.timestamp === 'number' && Number.isFinite(event.timestamp)) ||
+    (event.timestamp instanceof Date && !Number.isNaN(event.timestamp.getTime()))
+  ) {
+    const d = event.timestamp instanceof Date ? event.timestamp : new Date(event.timestamp);
+    if (Number.isNaN(d.getTime())) {
+      throw new TypeError(`Invalid timestamp: "${event.timestamp}"`);
+    }
+    timestamp = d.toISOString();
   } else {
-    throw new TypeError('timestamp must be an ISO string or epoch number');
+    throw new TypeError('timestamp must be a valid ISO string, epoch number, or Date');
   }
 
   const record = { timestamp, phase: event.phase };
@@ -128,19 +137,16 @@ function validateAndSanitizeEvent(event) {
   return record;
 }
 
-function resolveActivityFile(jobDir, options = {}) {
-  if (!jobDir || typeof jobDir !== 'string') {
+function resolveActivityFile(jobDir) {
+  if (!jobDir || typeof jobDir !== 'string' || jobDir.trim().length === 0) {
     throw new TypeError('jobDir must be a non-empty string path');
   }
-  const resolved = path.resolve(jobDir);
-  if (options.filePath) return path.resolve(options.filePath);
-  const fileName = options.filename || options.fileName || 'activity.jsonl';
-  return path.join(resolved, fileName);
+  return path.join(path.resolve(jobDir), 'activity.jsonl');
 }
 
 export async function appendActivityEvent(jobDir, event, options = {}) {
   const record = validateAndSanitizeEvent(event);
-  const filePath = resolveActivityFile(jobDir, options);
+  const filePath = resolveActivityFile(jobDir);
 
   const st = await fsp.stat(path.resolve(jobDir));
   if (!st.isDirectory()) throw new Error(`jobDir must be an existing directory: ${jobDir}`);
@@ -159,7 +165,7 @@ export async function appendActivityEvent(jobDir, event, options = {}) {
 }
 
 export async function readActivityEvents(jobDir, options = {}) {
-  const filePath = resolveActivityFile(jobDir, options);
+  const filePath = resolveActivityFile(jobDir);
   let content;
   try {
     content = await fsp.readFile(filePath, 'utf8');
@@ -181,15 +187,17 @@ export async function readActivityEvents(jobDir, options = {}) {
   for (let i = 0; i < nonEmpties.length; i++) {
     const isLast = i === nonEmpties.length - 1;
     const { lineNum, text } = nonEmpties[i];
+    let parsed;
     try {
-      events.push(JSON.parse(text));
+      parsed = JSON.parse(text);
     } catch (parseErr) {
       if (isLast) {
         truncatedTail = text;
-      } else {
-        throw new Error(`Malformed activity event JSON at line ${lineNum}: ${parseErr.message}`);
+        break;
       }
+      throw new Error(`Malformed activity event JSON at line ${lineNum}: ${parseErr.message}`);
     }
+    events.push(validateAndSanitizeEvent(parsed));
   }
 
   const limit = Math.min(options.limit ?? 100, 100);

@@ -168,3 +168,52 @@ test('read tolerates one truncated final line but rejects malformed earlier line
     );
   });
 });
+
+test('rejects case-insensitive forbidden fields', async () => {
+  await withTempDir(async (jobDir) => {
+    for (const key of ['CHAINOFTHOUGHT', 'chainofthought', 'THINKING', 'Secret', 'Prompt']) {
+      await assert.rejects(
+        () => appendActivityEvent(jobDir, { phase: 'running', [key]: 'x' }),
+        new RegExp(`Prohibited field in activity event: "${key}"`, 'i')
+      );
+    }
+  });
+});
+
+test('strictly normalizes timestamps to canonical ISO', async () => {
+  await withTempDir(async (jobDir) => {
+    const epoch = 1700000000000;
+    const res = await appendActivityEvent(jobDir, { phase: 'running', timestamp: epoch });
+    assert.equal(res.timestamp, new Date(epoch).toISOString());
+    const iso = '2026-09-09T00:00:00.000Z';
+    const res2 = await appendActivityEvent(jobDir, { phase: 'running', timestamp: iso });
+    assert.equal(res2.timestamp, iso);
+    for (const bad of ['bad-date', NaN, null, false, '']) {
+      await assert.rejects(() => appendActivityEvent(jobDir, { phase: 'running', timestamp: bad }), TypeError);
+    }
+  });
+});
+
+test('confines activity.jsonl to jobDir ignoring custom file options', async () => {
+  await withTempDir(async (jobDir) => {
+    const custom = path.join(jobDir, 'custom.jsonl');
+    await appendActivityEvent(jobDir, { phase: 'running' }, { filePath: custom, filename: 'custom.jsonl' });
+    assert.equal(await fsp.stat(path.join(jobDir, 'activity.jsonl')).then(() => true, () => false), true);
+    assert.equal(await fsp.stat(custom).then(() => true, () => false), false);
+    const read = await readActivityEvents(jobDir, { filePath: custom });
+    assert.equal(read.length, 1);
+  });
+});
+
+test('revalidates and sanitizes parsed events on read', async () => {
+  await withTempDir(async (jobDir) => {
+    const filePath = path.join(jobDir, 'activity.jsonl');
+    await fsp.writeFile(filePath, '{"phase":"running","thinking":"leaked"}\n');
+    await assert.rejects(() => readActivityEvents(jobDir), /Prohibited field in activity event/);
+    await fsp.writeFile(filePath, '{"phase":"not_a_phase"}\n');
+    await assert.rejects(() => readActivityEvents(jobDir), /Invalid or missing activity phase/);
+    await fsp.writeFile(filePath, JSON.stringify({ phase: 'running', message: 'hi\x00world' }) + '\n');
+    const sanitized = await readActivityEvents(jobDir);
+    assert.equal(sanitized[0].message, 'hi world');
+  });
+});
