@@ -1,0 +1,10 @@
+mcp/node_modules/
+mcp/bundle/
+
+.env
+.env.*
+*.log
+
+.DS_Store
+Thumbs.db
+Desktop.ini

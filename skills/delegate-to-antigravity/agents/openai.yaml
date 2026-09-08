@@ -1,0 +1,4 @@
+interface:
+  display_name: "Delegate to Antigravity"
+  short_description: "Delegate bounded tasks to Antigravity CLI"
+  default_prompt: "Use $delegate-to-antigravity to get a second-agent analysis of this task."

@@ -1,0 +1,21 @@
+{
+  "name": "dedsec-terminal-plugins",
+  "interface": {
+    "displayName": "DedSec Terminal Plugins"
+  },
+  "plugins": [
+    {
+      "name": "antigravity-subagent",
+      "source": {
+        "source": "url",
+        "url": "https://github.com/dedsec-terminal/transactional-antigravity-harness.git",
+        "ref": "v1.0.0"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Developer Tools"
+    }
+  ]
+}

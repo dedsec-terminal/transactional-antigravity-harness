@@ -1,0 +1,28 @@
+{
+  "name": "antigravity-subagent",
+  "version": "1.0.0",
+  "description": "Delegate bounded tasks from Codex to Google Antigravity CLI through a skill or MCP tools.",
+  "author": {
+    "name": "Swaraj Singh"
+  },
+  "license": "MIT",
+  "homepage": "https://github.com/dedsec-terminal/transactional-antigravity-harness",
+  "repository": "https://github.com/dedsec-terminal/transactional-antigravity-harness",
+  "keywords": ["antigravity", "agy", "mcp", "subagent", "delegation"],
+  "skills": "./skills/",
+  "mcpServers": "./.mcp.json",
+  "interface": {
+    "displayName": "Antigravity Subagent",
+    "shortDescription": "Delegate tasks to Antigravity CLI via MCP.",
+    "longDescription": "Adds a guarded skill and local stdio MCP server for invoking Google Antigravity CLI in headless mode as an external second agent.",
+    "developerName": "dedsec-terminal",
+    "websiteURL": "https://github.com/dedsec-terminal/transactional-antigravity-harness",
+    "category": "Developer Tools",
+    "capabilities": ["MCP Tools", "Local CLI", "Delegation", "Code Review"],
+    "defaultPrompt": [
+      "Use Antigravity as a subagent to review this approach.",
+      "Delegate this bounded research task to Antigravity.",
+      "Ask Antigravity for a second opinion on this bug."
+    ]
+  }
+}

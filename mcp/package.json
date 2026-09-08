@@ -1,0 +1,52 @@
+{
+  "name": "@dedsec-terminal/agy-mcp-server",
+  "version": "1.0.0",
+  "description": "Model Context Protocol (MCP) server for transactional Antigravity CLI delegation and task execution",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/dedsec-terminal/transactional-antigravity-harness.git"
+  },
+  "publishConfig": {
+    "registry": "https://npm.pkg.github.com",
+    "access": "public"
+  },
+  "bin": {
+    "agy-mcp-server": "dist/server.cjs"
+  },
+  "files": [
+    "dist/server.cjs",
+    "bundle/skills/"
+  ],
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "antigravity",
+    "codex",
+    "harness",
+    "orchestration"
+  ],
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "esbuild src/index.ts --bundle --minify --platform=node --format=cjs --target=node20 --outfile=dist/server.cjs",
+    "check": "tsc --noEmit",
+    "prepack": "npm run build && node scripts/package-assets.mjs prepare",
+    "postpack": "node scripts/package-assets.mjs clean",
+    "test": "node test/ledger-outbox.mjs && node test/process-leases.mjs && node test/contracts.mjs && node test/git-artifacts.mjs && node test/runner-controller.mjs && node test/smoke.mjs --protocol-only && node test/deterministic.mjs",
+    "test:protocol": "node test/smoke.mjs --protocol-only",
+    "test:live": "node test/smoke.mjs"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/server": "2.0.0",
+    "zod": "4.4.3"
+  },
+  "devDependencies": {
+    "@modelcontextprotocol/client": "2.0.0",
+    "@types/node": "24.10.1",
+    "esbuild": "0.28.1",
+    "typescript": "5.9.3"
+  }
+}
