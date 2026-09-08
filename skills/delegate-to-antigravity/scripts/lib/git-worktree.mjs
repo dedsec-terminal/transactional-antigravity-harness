@@ -454,39 +454,147 @@ export function listWorktrees(repoRoot) {
   return trees;
 }
 
-export async function createWorktree({ repoRoot, worktreePath, baseSha, callerId }) {
+/**
+ * Creates a git worktree for isolated execution, optionally using Git cone sparse checkout.
+ *
+ * Sparse checkout notes:
+ * - Git cone sparse checkout includes ancestor files and siblings in selected directories,
+ *   not exact-file isolation.
+ * - Directory paths select the directory.
+ * - Tracked file paths select their parent directory.
+ * - Root files imply root-only selection (Git cone mode naturally includes all root files).
+ * - Glob metacharacters (*, ?, [, ], {, }) are rejected for checkoutPaths; literal paths only.
+ * - When checkoutPaths is omitted, standard full checkout behavior is preserved.
+ *
+ * @param {Object} options
+ * @param {string} options.repoRoot - Path to repository root.
+ * @param {string} options.worktreePath - Target path for new worktree.
+ * @param {string} [options.baseSha] - Base commit SHA (defaults to repo HEAD).
+ * @param {string} [options.callerId] - Identifier of calling process or job.
+ * @param {string[]} [options.checkoutPaths] - Optional array of repo-relative paths for sparse checkout.
+ * @returns {Promise<{ worktreePath: string, baseSha: string, repoRoot: string, commonDir: string, marker: Object }>}
+ */
+export async function createWorktree({ repoRoot, worktreePath, baseSha, callerId, checkoutPaths, gitRunner = runGit }) {
   const repoInfo = validateRepository(repoRoot);
   const targetBase = baseSha || repoInfo.headSha;
 
+  let selectedConeDirs = null;
+  if (checkoutPaths !== undefined) {
+    for (const raw of (Array.isArray(checkoutPaths) ? checkoutPaths : [])) {
+      if (typeof raw === "string" && /[*?[\]{}]/.test(raw)) {
+        throw new GitValidationError(
+          `checkoutPaths must be literal paths; glob metacharacters are rejected: '${raw}'`,
+          "GLOB_NOT_SUPPORTED",
+          { target: raw },
+        );
+      }
+    }
+
+    const normalizedTargets = normalizeDeclaredTargets(checkoutPaths);
+
+    const dirSet = new Set();
+    for (const target of normalizedTargets) {
+      const catRes = runGit(["cat-file", "-t", `${targetBase}:${target}`], {
+        cwd: repoInfo.repoRoot,
+        allowFailure: true,
+      });
+      const objType = catRes.status === 0 ? catRes.stdout.trim() : null;
+
+      if (objType === "tree") {
+        // Directory path selects directory
+        dirSet.add(target);
+      } else if (objType === "blob") {
+        // Tracked file path selects parent directory; root files imply root-only selection
+        const parentDir = path.posix.dirname(target);
+        if (parentDir !== "." && parentDir !== "") {
+          dirSet.add(parentDir);
+        }
+      } else {
+        throw new GitValidationError(
+          `checkoutPath not found at base commit ${targetBase}: '${target}' (caller must select an existing parent directory for new files)`,
+          "PATH_NOT_FOUND",
+          { target, baseSha: targetBase },
+        );
+      }
+    }
+
+    selectedConeDirs = Array.from(dirSet);
+  }
+
   const resolvedWorktree = path.resolve(worktreePath);
+  if (canonicalPath(resolvedWorktree).toLowerCase() === repoInfo.repoRoot.toLowerCase()) {
+    throw new GitValidationError(
+      `Safety violation: cannot create worktree at canonical repository root: ${resolvedWorktree}`,
+      "CANONICAL_REPO_SAFETY_VIOLATION",
+      { path: resolvedWorktree, repoRoot: repoInfo.repoRoot },
+    );
+  }
+
   await fsp.mkdir(path.dirname(resolvedWorktree), { recursive: true });
 
+  let canonicalWorktree;
+  let marker;
+
   await withCommonDirLock(repoInfo.commonDir, async () => {
-    runGit(["worktree", "add", "--detach", resolvedWorktree, targetBase], {
-      cwd: repoInfo.repoRoot,
-    });
+    let treeCreated = false;
+    try {
+      if (selectedConeDirs !== null) {
+        gitRunner(["worktree", "add", "--no-checkout", "--detach", resolvedWorktree, targetBase], {
+          cwd: repoInfo.repoRoot,
+        });
+        treeCreated = true;
+        gitRunner(["sparse-checkout", "set", "--cone", "--", ...selectedConeDirs], {
+          cwd: resolvedWorktree,
+        });
+        gitRunner(["checkout"], {
+          cwd: resolvedWorktree,
+        });
+      } else {
+        gitRunner(["worktree", "add", "--detach", resolvedWorktree, targetBase], {
+          cwd: repoInfo.repoRoot,
+        });
+        treeCreated = true;
+      }
+
+      canonicalWorktree = canonicalPath(resolvedWorktree);
+
+      marker = {
+        version: 1,
+        harness: "antigravity-delegation-harness",
+        createdAt: new Date().toISOString(),
+        pid: process.pid,
+        repoRoot: repoInfo.repoRoot,
+        commonDir: repoInfo.commonDir,
+        worktreePath: canonicalWorktree,
+        baseSha: targetBase,
+        callerId: callerId ?? null,
+      };
+
+      // Store ownership evidence in this worktree's dedicated Git admin directory.
+      // A checkout marker becomes worker output; common info/exclude is shared state.
+      const gitDirRes = gitRunner(["rev-parse", "--git-dir"], { cwd: resolvedWorktree });
+      const worktreeGitDir = canonicalPath(path.resolve(resolvedWorktree, gitDirRes.stdout.trim()));
+      const markerFile = path.join(worktreeGitDir, "agy-worktree.json");
+      await fsp.writeFile(markerFile, JSON.stringify(marker, null, 2), "utf8");
+    } catch (err) {
+      if (treeCreated) {
+        const canonicalTarget = canonicalPath(resolvedWorktree);
+        const canonicalRepo = canonicalPath(repoInfo.repoRoot);
+        if (canonicalTarget.toLowerCase() !== canonicalRepo.toLowerCase()) {
+          runGit(["worktree", "remove", "--force", resolvedWorktree], {
+            cwd: repoInfo.repoRoot,
+            allowFailure: true,
+          });
+          await fsp.rm(resolvedWorktree, { recursive: true, force: true }).catch(() => {});
+          runGit(["worktree", "prune"], {
+            cwd: repoInfo.repoRoot,
+            allowFailure: true,
+          });
+        }
+      }
+      throw err;
+    }
   });
-
-  const canonicalWorktree = canonicalPath(resolvedWorktree);
-
-  const marker = {
-    version: 1,
-    harness: "antigravity-delegation-harness",
-    createdAt: new Date().toISOString(),
-    pid: process.pid,
-    repoRoot: repoInfo.repoRoot,
-    commonDir: repoInfo.commonDir,
-    worktreePath: canonicalWorktree,
-    baseSha: targetBase,
-    callerId: callerId ?? null,
-  };
-
-  // Store ownership evidence in this worktree's dedicated Git admin directory.
-  // A checkout marker becomes worker output; common info/exclude is shared state.
-  const gitDirRes = runGit(["rev-parse", "--git-dir"], { cwd: resolvedWorktree });
-  const worktreeGitDir = canonicalPath(path.resolve(resolvedWorktree, gitDirRes.stdout.trim()));
-  const markerFile = path.join(worktreeGitDir, "agy-worktree.json");
-  await fsp.writeFile(markerFile, JSON.stringify(marker, null, 2), "utf8");
 
   return {
     worktreePath: canonicalWorktree,
