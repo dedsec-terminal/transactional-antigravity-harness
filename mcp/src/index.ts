@@ -43,6 +43,7 @@ export type RunnerInput = {
   resumeJobId?: string;
   retentionMinutes?: number;
   jobId?: string;
+  subagents?: number;
 };
 
 export type DelegateInput = RunnerInput;
@@ -170,8 +171,12 @@ function delegateArgs(input: DelegateInput, promptFile: string): string[] {
   if (input.resumeJobId) args.push('--resume-job-id', input.resumeJobId);
   if (input.retentionMinutes !== undefined) args.push('--retention-minutes', String(input.retentionMinutes));
   if (input.jobId) args.push('--job-id', input.jobId);
+  if (input.subagents !== undefined) args.push('--subagents', String(input.subagents));
   return args;
 }
+
+export const serializeRunnerArgs = delegateArgs;
+export { delegateArgs };
 
 function parseAgyMeta(stdout: string): Record<string, unknown> {
   const line = stdout.split(/\r?\n/).find((value) => value.startsWith('AGY_META '));
@@ -209,6 +214,9 @@ const delegateSchema = {
   isolation: z.enum(['worktree', 'shared']).optional(),
   resumeJobId: z.string().min(1).max(200).optional(),
   retentionMinutes: z.number().int().min(10).max(10080).optional(),
+  subagents: z.number().int().min(0).max(8).optional().describe(
+    'Optional subagents limit (0..8). Omission uses controller auto policy.',
+  ),
 };
 
 function createServer(): McpServer {
@@ -273,7 +281,7 @@ function createServer(): McpServer {
         idempotentHint: false,
       },
     },
-    async ({ prompt, cwd, mode, outputFormat, timeoutSeconds, agent, model, targets, sparseCheckout, isolation, resumeJobId, retentionMinutes }) => {
+    async ({ prompt, cwd, mode, outputFormat, timeoutSeconds, agent, model, targets, sparseCheckout, isolation, resumeJobId, retentionMinutes, subagents }) => {
       if (!(await runnerAvailable())) return failure(`Antigravity runner was not found at: ${runnerPath()}`);
       let resolvedCwd: string;
       try {
@@ -287,7 +295,7 @@ function createServer(): McpServer {
       const promptFile = await createPromptFile(prompt);
       try {
         const args = delegateArgs(
-          { prompt, cwd: resolvedCwd, mode, outputFormat, timeoutSeconds, agent, model, targets, sparseCheckout, isolation, resumeJobId, retentionMinutes, jobId },
+          { prompt, cwd: resolvedCwd, mode, outputFormat, timeoutSeconds, agent, model, targets, sparseCheckout, isolation, resumeJobId, retentionMinutes, jobId, subagents },
           promptFile.file,
         );
         const result = await runProcess(
@@ -345,7 +353,7 @@ function createServer(): McpServer {
         idempotentHint: false,
       },
     },
-    async ({ prompt, cwd, mode, outputFormat, timeoutSeconds, agent, model, targets, sparseCheckout, isolation, resumeJobId, retentionMinutes, notifyThread }) => {
+    async ({ prompt, cwd, mode, outputFormat, timeoutSeconds, agent, model, targets, sparseCheckout, isolation, resumeJobId, retentionMinutes, notifyThread, subagents }) => {
       if (!(await runnerAvailable())) return failure(`Antigravity runner was not found at: ${runnerPath()}`);
       let resolvedCwd: string;
       try {
@@ -366,7 +374,7 @@ function createServer(): McpServer {
       const jobId = resumeJobId || randomUUID();
       const promptFile = await createPromptFile(prompt);
       const args = delegateArgs(
-        { prompt, cwd: resolvedCwd, mode, outputFormat, timeoutSeconds, agent, model, targets, sparseCheckout, isolation, resumeJobId, retentionMinutes, jobId },
+        { prompt, cwd: resolvedCwd, mode, outputFormat, timeoutSeconds, agent, model, targets, sparseCheckout, isolation, resumeJobId, retentionMinutes, jobId, subagents },
         promptFile.file,
       );
       args.push('--notify-thread', notifyThread, '--cleanup-prompt-file', '--async');

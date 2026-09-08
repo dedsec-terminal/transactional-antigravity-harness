@@ -148,6 +148,77 @@ export async function acquireSlot(options = {}) {
 }
 
 /**
+ * Reserves a slot lease before spawning the worker process.
+ * Uses controller processIdentity with metadata.phase="reserved".
+ */
+export async function reserveSlot(options = {}) {
+  const processIdentity = options.controllerProcessIdentity || options.processIdentity;
+  const controllerPid = options.controllerPid ?? processIdentity?.pid;
+  return acquireSlot({
+    ...options,
+    processIdentity,
+    controllerPid,
+    metadata: { ...options.metadata, phase: "reserved" },
+  });
+}
+
+/**
+ * Activates a previously reserved slot with the spawned worker process identity.
+ * Verifies exact nonce, jobId, attemptId, and phase="reserved" under slot lock.
+ */
+export async function activateReservedSlot(options = {}) {
+  const {
+    stateRoot, slotId, slotPath: customSlotPath, nonce, jobId, attemptId,
+    workerProcessIdentity, processIdentity, metadata: extraMetadata,
+  } = options;
+  const targetNonce = nonce || options.lease?.nonce;
+  const targetJobId = jobId || options.lease?.jobId;
+  const targetAttemptId = attemptId || options.lease?.attemptId;
+  const targetSlotId = slotId ?? options.lease?.slotId;
+  const worker = workerProcessIdentity || processIdentity;
+
+  if (!stateRoot && !customSlotPath) throw new Error("stateRoot or slotPath is required to activate a reserved slot");
+  if (targetSlotId === undefined && !customSlotPath) throw new Error("slotId or slotPath is required to activate a reserved slot");
+  if (!targetNonce || !targetJobId || !targetAttemptId || !worker || !worker.pid) {
+    return { activated: false, reason: "missing_required_fields" };
+  }
+
+  const slotPath = customSlotPath || path.join(getSlotsDir(stateRoot), `slot-${targetSlotId}.json`);
+
+  const lockResult = await withSlotLock(slotPath, async () => {
+    let current;
+    try {
+      current = JSON.parse(await fsp.readFile(slotPath, "utf8"));
+    } catch (err) {
+      if (err.code === "ENOENT") return { activated: false, reason: "slot_not_found" };
+      return { activated: false, reason: "corrupt_lease" };
+    }
+
+    if (current.nonce !== targetNonce) return { activated: false, reason: "nonce_mismatch", lease: current };
+    if (current.jobId !== targetJobId) return { activated: false, reason: "job_id_mismatch", lease: current };
+    if (current.attemptId !== targetAttemptId) return { activated: false, reason: "attempt_id_mismatch", lease: current };
+    if (current.metadata?.phase !== "reserved") return { activated: false, reason: "phase_not_reserved", phase: current.metadata?.phase, lease: current };
+
+    const updatedLease = {
+      ...current,
+      pid: Number(worker.pid),
+      creationTime: worker.creationTime || new Date().toISOString(),
+      executable: worker.executable || "",
+      commandLine: worker.commandLine || "",
+      metadata: { ...(current.metadata || {}), ...(extraMetadata || {}), phase: "active" },
+    };
+
+    const tmpPath = `${slotPath}.${crypto.randomUUID()}.tmp`;
+    await fsp.writeFile(tmpPath, JSON.stringify(updatedLease, null, 2), "utf8");
+    await fsp.rename(tmpPath, slotPath);
+
+    return { activated: true, slotId: updatedLease.slotId, slotPath, lease: updatedLease };
+  });
+
+  return lockResult?.locked ? { activated: false, reason: "slot_locked", slotPath } : lockResult;
+}
+
+/**
  * Releases an acquired slot by removing its lease file.
  * Verifies jobId/attemptId ownership unless force is true.
  */
@@ -651,6 +722,23 @@ export class SlotLeaseManager {
       maxSlots: this.maxSlots,
       staleTimeoutMs: this.staleTimeoutMs,
       processSupervisor: options.processSupervisor || this.processSupervisor,
+      ...options,
+    });
+  }
+
+  async reserve(options = {}) {
+    return reserveSlot({
+      stateRoot: this.stateRoot,
+      maxSlots: this.maxSlots,
+      staleTimeoutMs: this.staleTimeoutMs,
+      processSupervisor: options.processSupervisor || this.processSupervisor,
+      ...options,
+    });
+  }
+
+  async activateReserved(options = {}) {
+    return activateReservedSlot({
+      stateRoot: this.stateRoot,
       ...options,
     });
   }

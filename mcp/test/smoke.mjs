@@ -51,6 +51,13 @@ try {
   assert.equal(delegatedTool.inputSchema.properties.retentionMinutes.minimum, 10);
   assert.equal(delegatedTool.inputSchema.properties.retentionMinutes.maximum, 10080);
   assert.ok(delegatedTool.inputSchema.properties.targets);
+  assert.equal(delegatedTool.inputSchema.properties.subagents.type, 'integer');
+  assert.equal(delegatedTool.inputSchema.properties.subagents.minimum, 0);
+  assert.equal(delegatedTool.inputSchema.properties.subagents.maximum, 8);
+  assert.match(delegatedTool.inputSchema.properties.subagents.description, /controller auto policy/i);
+  assert.equal(asyncTool.inputSchema.properties.subagents.type, 'integer');
+  assert.equal(asyncTool.inputSchema.properties.subagents.minimum, 0);
+  assert.equal(asyncTool.inputSchema.properties.subagents.maximum, 8);
   assert.ok(asyncTool.inputSchema.required.includes('notifyThread'));
 
   if (!protocolOnly) {

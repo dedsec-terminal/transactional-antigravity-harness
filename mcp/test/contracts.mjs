@@ -486,3 +486,34 @@ test("Protocol contract: sparseCheckout schema, description, handler forwarding,
     "Must not serialize --sparse-checkout when omitted (default false)",
   );
 });
+
+test("Protocol contract: subagents schema, forwarding, and runner serialization", async () => {
+  const here = path.dirname(fileURLToPath(import.meta.url));
+  const content = await fsp.readFile(path.resolve(here, "../src/index.ts"), "utf8");
+
+  assert.match(content, /type\s+RunnerInput\s*=\s*\{[\s\S]*?subagents\?:\s*number;?[\s\S]*?\};/);
+  assert.match(content, /subagents:\s*z\.number\(\)\.int\(\)\.min\(0\)\.max\(8\)\.optional\(\)\.describe\(/);
+
+  const descMatch = content.match(/subagents:\s*z\.number\(\)[\s\S]*?\.describe\(\s*([\s\S]*?)\s*\),/);
+  assert.ok(descMatch);
+  assert.match(descMatch[1], /controller auto policy/i);
+  assert.match(descMatch[1], /omission/i);
+
+  assert.match(content, /server\.registerTool\(\s*['"]agy_delegate['"][\s\S]*?async\s*\(\{[^}]*subagents[^}]*\}\)/);
+  assert.match(content, /server\.registerTool\(\s*['"]agy_delegate_async['"][\s\S]*?async\s*\(\{[^}]*subagents[^}]*\}\)/);
+
+  const delegateMatches = [...content.matchAll(/delegateArgs\(\s*\{[\s\S]*?subagents[\s\S]*?\}\s*,\s*promptFile\.file\s*,?\s*\)/g)];
+  assert.equal(delegateMatches.length, 2);
+
+  assert.match(content, /input\.subagents\s*!==\s*undefined/);
+  assert.match(content, /args\.push\(['"]--subagents['"],\s*String\(input\.subagents\)\)/);
+
+  function simulateRunnerArgs(input) {
+    const args = [];
+    if (input.subagents !== undefined) args.push("--subagents", String(input.subagents));
+    return args;
+  }
+  assert.deepEqual(simulateRunnerArgs({ subagents: 0 }), ["--subagents", "0"]);
+  assert.deepEqual(simulateRunnerArgs({ subagents: 8 }), ["--subagents", "8"]);
+  assert.deepEqual(simulateRunnerArgs({}), []);
+});

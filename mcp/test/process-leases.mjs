@@ -21,6 +21,8 @@ import {
 import {
   DEFAULT_MAX_SLOTS,
   acquireSlot,
+  reserveSlot,
+  activateReservedSlot,
   releaseSlot,
   classifyLease,
   scanLeases,
@@ -576,6 +578,120 @@ describe("Windows Process Supervision and Max-Four Slot Leasing", () => {
       const validation = validateProcessIdentity(recorded, live, { platform: "win32" });
       assert.equal(validation.matches, false);
       assert.equal(validation.reason, "command_line_mismatch");
+    });
+  });
+
+  describe("8. Pre-spawn reservation, activation, mismatch, release", () => {
+    it("reserves slot with controller identity, activates with worker identity, and releases", async () => {
+      const controllerIdentity = {
+        pid: 9600,
+        creationTime: "2026-09-07T12:00:00.000Z",
+        executable: "cmd.exe",
+        commandLine: "cmd.exe /c controller",
+      };
+      const workerIdentity = {
+        pid: 9601,
+        creationTime: "2026-09-07T12:00:05.000Z",
+        executable: "node.exe",
+        commandLine: "node worker.js",
+      };
+
+      const reserved = await reserveSlot({
+        stateRoot: tmpRoot,
+        jobId: "job-reserve",
+        attemptId: "att-reserve",
+        controllerProcessIdentity: controllerIdentity,
+      });
+      assert.equal(reserved.acquired, true);
+      assert.equal(reserved.slotId, 0);
+      assert.equal(reserved.lease.pid, 9600);
+      assert.equal(reserved.lease.controllerPid, 9600);
+      assert.equal(reserved.lease.metadata?.phase, "reserved");
+
+      const activated = await activateReservedSlot({
+        stateRoot: tmpRoot,
+        slotId: 0,
+        nonce: reserved.lease.nonce,
+        jobId: "job-reserve",
+        attemptId: "att-reserve",
+        workerProcessIdentity: workerIdentity,
+      });
+      assert.equal(activated.activated, true);
+      assert.equal(activated.slotId, 0);
+      assert.equal(activated.lease.pid, 9601);
+      assert.equal(activated.lease.controllerPid, 9600);
+      assert.equal(activated.lease.nonce, reserved.lease.nonce);
+      assert.equal(activated.lease.acquiredAt, reserved.lease.acquiredAt);
+      assert.equal(activated.lease.metadata?.phase, "active");
+
+      const released = await releaseSlot({
+        stateRoot: tmpRoot,
+        slotId: 0,
+        jobId: "job-reserve",
+        attemptId: "att-reserve",
+      });
+      assert.equal(released.released, true);
+      assert.equal(await getAvailableCount({ stateRoot: tmpRoot }), DEFAULT_MAX_SLOTS);
+    });
+
+    it("fails closed on nonce, job, attempt, and phase mismatches", async () => {
+      const controllerIdentity = { pid: 9700, creationTime: "2026-09-07T12:00:00.000Z", executable: "node.exe", commandLine: "node controller.js" };
+      const workerIdentity = { pid: 9701, creationTime: "2026-09-07T12:00:05.000Z", executable: "node.exe", commandLine: "node worker.js" };
+
+      const reserved = await reserveSlot({
+        stateRoot: tmpRoot,
+        jobId: "job-mismatch",
+        attemptId: "att-1",
+        processIdentity: controllerIdentity,
+      });
+      assert.equal(reserved.acquired, true);
+
+      // Nonce mismatch
+      const wrongNonce = await activateReservedSlot({
+        stateRoot: tmpRoot,
+        slotId: reserved.slotId,
+        nonce: "wrong-nonce",
+        jobId: "job-mismatch",
+        attemptId: "att-1",
+        workerProcessIdentity: workerIdentity,
+      });
+      assert.equal(wrongNonce.activated, false);
+      assert.equal(wrongNonce.reason, "nonce_mismatch");
+
+      // Job/attempt mismatch
+      const wrongJob = await activateReservedSlot({
+        stateRoot: tmpRoot,
+        slotId: reserved.slotId,
+        nonce: reserved.lease.nonce,
+        jobId: "wrong-job",
+        attemptId: "att-1",
+        workerProcessIdentity: workerIdentity,
+      });
+      assert.equal(wrongJob.activated, false);
+      assert.equal(wrongJob.reason, "job_id_mismatch");
+
+      // Activate successfully
+      const okActivate = await activateReservedSlot({
+        stateRoot: tmpRoot,
+        slotId: reserved.slotId,
+        nonce: reserved.lease.nonce,
+        jobId: "job-mismatch",
+        attemptId: "att-1",
+        workerProcessIdentity: workerIdentity,
+      });
+      assert.equal(okActivate.activated, true);
+
+      // Double activation fails closed because phase is active
+      const doubleActivate = await activateReservedSlot({
+        stateRoot: tmpRoot,
+        slotId: reserved.slotId,
+        nonce: reserved.lease.nonce,
+        jobId: "job-mismatch",
+        attemptId: "att-1",
+        workerProcessIdentity: workerIdentity,
+      });
+      assert.equal(doubleActivate.activated, false);
+      assert.equal(doubleActivate.reason, "phase_not_reserved");
     });
   });
 });
