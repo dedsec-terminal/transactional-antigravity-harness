@@ -10,11 +10,16 @@ import {
   exactAsyncResponse,
   getRunContext,
   persistBeforeSpawn,
+  recordWorkerSpawn,
+  releaseWorker,
+  reserveWorker,
   resolveRunConfig,
   retryOutbox,
   runJobAction,
 } from "../../skills/delegate-to-antigravity/scripts/lib/controller.mjs";
+import { readActivityEvents } from "../../skills/delegate-to-antigravity/scripts/lib/activity.mjs";
 import { runGit } from "../../skills/delegate-to-antigravity/scripts/lib/git-worktree.mjs";
+import { getActiveCount } from "../../skills/delegate-to-antigravity/scripts/lib/leases.mjs";
 
 async function tempRoot(prefix) { return fsp.mkdtemp(path.join(os.tmpdir(), prefix)); }
 
@@ -505,6 +510,45 @@ test("subagents metadata persistence, resume match enforcement, and callback lin
     assert.equal(legacyResumed.attempt.manifest.metadata?.subagents, 0);
 
     await runJobAction(root, "finalize", prepared.job.jobId);
+  } finally {
+    await fsp.rm(root, { recursive: true, force: true });
+    await fsp.rm(repo, { recursive: true, force: true });
+  }
+});
+
+test("adaptive reservation activates before execution and cleans up failed persistence", async () => {
+  const root = await tempRoot("agy-capacity-");
+  const repo = await tempRoot("agy-capacity-repo-");
+  const sample = {
+    logicalCpuCount: 8,
+    totalMemoryBytes: 16 * 1024 ** 3,
+    freeMemoryBytes: 12 * 1024 ** 3,
+    cpuUtilizationRatio: 0.1,
+  };
+  const controller = { pid: process.pid, creationTime: new Date().toISOString(), executable: "node", commandLine: "node test" };
+  try {
+    const prepared = await persistBeforeSpawn({ root, params: { cwd: repo, mode: "plan", prompt: "capacity" } });
+    const reserved = await reserveWorker(root, prepared.job.jobId, prepared.attempt.attemptId, controller, { sampleSystemCapacity: () => sample });
+    assert.equal(reserved.acquired, true);
+
+    const worker = { ...controller, executable: "agy" };
+    const activated = await recordWorkerSpawn(root, prepared.job.jobId, prepared.attempt.attemptId, worker);
+    assert.equal(activated.acquired, true);
+    const record = JSON.parse(await fsp.readFile(path.join(prepared.attempt.attemptDir, "worker.json"), "utf8"));
+    assert.equal(record.phase, "active");
+    assert.equal(record.identity.executable, "agy");
+    assert.deepEqual((await readActivityEvents(path.join(root, "jobs", prepared.job.jobId))).map(({ phase }) => phase), ["accepted", "preparing", "running"]);
+    await releaseWorker(root, prepared.job.jobId, prepared.attempt.attemptId);
+
+    const failed = await persistBeforeSpawn({ root, params: { cwd: repo, mode: "plan", prompt: "cleanup" } });
+    await fsp.mkdir(path.join(failed.attempt.attemptDir, "worker.json"));
+    await assert.rejects(() => reserveWorker(root, failed.job.jobId, failed.attempt.attemptId, controller, { sampleSystemCapacity: () => sample }));
+    assert.equal(await getActiveCount({ stateRoot: root, maxSlots: 8 }), 0);
+
+    await assert.rejects(
+      () => reserveWorker(root, failed.job.jobId, failed.attempt.attemptId, controller, { sampleSystemCapacity: () => sample, activeWorkers: 8 }),
+      (error) => error.code === "CAPACITY_EXHAUSTED",
+    );
   } finally {
     await fsp.rm(root, { recursive: true, force: true });
     await fsp.rm(repo, { recursive: true, force: true });

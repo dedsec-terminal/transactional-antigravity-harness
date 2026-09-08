@@ -18,10 +18,16 @@ import {
   persistBeforeSpawn,
   recordWorkerSpawn,
   releaseWorker,
+  reserveWorker,
   resolveRunConfig,
   runJobAction,
   workerSchemaArgument,
 } from "./lib/controller.mjs";
+import {
+  DEFAULT_MAX_WORKERS,
+  recommendWorkerCapacity,
+  sampleSystemCapacity,
+} from "./lib/system-capacity.mjs";
 import { queryProcessIdentity } from "./lib/windows-process.mjs";
 import { createBoundedStreamCollector } from "./lib/storage.mjs";
 
@@ -370,7 +376,37 @@ if (!executable) fail("Antigravity CLI was not found. Install and authenticate t
 if (options.check) {
   const codex = await findCodex();
   const health = await healthSnapshot(stateRoot).catch((error) => ({ error: sanitizeLine(error.message) }));
-  process.stdout.write(`${JSON.stringify({ available: true, executable, runnerVersion: VERSION, codexCallbackAvailable: Boolean(codex), codexExecutable: codex?.displayPath ?? null, isolationDefaults: { syncPlan: "shared", syncAcceptEdits: "worktree", async: "worktree" }, workerSlots: 4, stateRoot: process.env.AGY_STATE_ROOT || null, health })}\n`);
+  let capacity = null;
+  try {
+    const sample = await sampleSystemCapacity();
+    capacity = recommendWorkerCapacity(sample, { activeWorkers: health?.activeSlots ?? 0 });
+  } catch {
+    // Keep --check available even if capacity sampling or recommendation fails.
+  }
+  const checkPayload = {
+    available: true,
+    executable,
+    runnerVersion: VERSION,
+    codexCallbackAvailable: Boolean(codex),
+    codexExecutable: codex?.displayPath ?? null,
+    isolationDefaults: { syncPlan: "shared", syncAcceptEdits: "worktree", async: "worktree" },
+    ...(capacity
+      ? {
+          capacity,
+          workerCapacity: capacity,
+          recommendedSlots: capacity.recommendedSlots,
+          availableSlots: capacity.availableSlots,
+          maxWorkers: DEFAULT_MAX_WORKERS,
+        }
+      : {
+          capacity: null,
+          workerCapacity: null,
+          maxWorkers: DEFAULT_MAX_WORKERS,
+        }),
+    stateRoot: process.env.AGY_STATE_ROOT || null,
+    health,
+  };
+  process.stdout.write(`${JSON.stringify(checkPayload)}\n`);
   process.exit(0);
 }
 
@@ -436,6 +472,11 @@ agyArgs.push("--model", options.model || "gemini-3.8-flash-high");
 
 let result;
 try {
+  const controllerIdentity = await stableProcessIdentity(process.pid);
+  const reservation = await reserveWorker(context.root, context.job.jobId, context.attempt.attemptId, controllerIdentity);
+  if (reservation && (reservation.acquired === false || reservation.reserved === false || reservation.success === false)) {
+    throw new Error(reservation.reason || reservation.error || "Failed to reserve worker slot");
+  }
   const boundedPrompt = `HARNESS WORKSPACE BOUNDARY: ${executionCwd}\n${buildWorkerPrompt(context.request, prompt)}`;
   const input = `${JSON.stringify({ event: "user", message: { content: boundedPrompt } })}\n`;
   result = await run(executable, agyArgs, executionCwd, runConfig.timeoutSeconds * 1000 + WRAPPER_GRACE_MS, input, async (child) => {
