@@ -24,6 +24,11 @@ function parseJsonOption(value, fallback) {
   return typeof value === "string" ? JSON.parse(value) : value;
 }
 
+function defaultSubagentsForTargets(targets = []) {
+  const count = Array.isArray(targets) ? targets.length : 0;
+  return count < 4 ? 0 : Math.min(4, count);
+}
+
 export function resolveRunConfig(options = {}) {
   const mode = options.mode ?? "accept-edits";
   if (!["plan", "accept-edits"].includes(mode)) throw new Error(`Unsupported mode: ${mode}`);
@@ -55,7 +60,20 @@ export function resolveRunConfig(options = {}) {
       throw new Error("sparseCheckout requires at least one declared target");
     }
   }
-  return { mode, async: asyncRun, isolation, timeoutSeconds, retentionMinutes, targets, sparseCheckout, outputFormat: options["output-format"] ?? options.outputFormat ?? "text" };
+  const rawSubagents = options.subagents ?? options["subagents"] ?? options["--subagents"];
+  let subagents;
+  if (rawSubagents !== undefined) {
+    if (typeof rawSubagents === "boolean" || rawSubagents === null || (typeof rawSubagents === "string" && rawSubagents.trim() === "")) {
+      throw new Error("--subagents must be an integer from 0 to 8");
+    }
+    subagents = Number(rawSubagents);
+    if (!Number.isInteger(subagents) || subagents < 0 || subagents > 8) {
+      throw new Error("--subagents must be an integer from 0 to 8");
+    }
+  } else {
+    subagents = defaultSubagentsForTargets(targets);
+  }
+  return { mode, async: asyncRun, isolation, timeoutSeconds, retentionMinutes, targets, sparseCheckout, subagents, outputFormat: options["output-format"] ?? options.outputFormat ?? "text" };
 }
 
 // The first line is the stable public response. MCP consumes the metadata line.
@@ -87,7 +105,7 @@ function worktreePathFor(root, repoIdentity, jobId) {
 }
 
 function jobMetadata(config, params, repo) {
-  return { mode: config.mode, isolation: config.isolation, targets: config.targets, sparseCheckout: config.sparseCheckout, retentionMinutes: config.retentionMinutes, callbackThread: params.callbackThread ?? null, repoIdentity: repo?.identity ?? null, baseSha: repo?.headSha ?? null };
+  return { mode: config.mode, isolation: config.isolation, targets: config.targets, sparseCheckout: config.sparseCheckout, subagents: config.subagents, retentionMinutes: config.retentionMinutes, callbackThread: params.callbackThread ?? null, repoIdentity: repo?.identity ?? null, baseSha: repo?.headSha ?? null };
 }
 
 export async function persistBeforeSpawn({ root, params = {}, now = Date.now() } = {}) {
@@ -111,6 +129,11 @@ export async function persistBeforeSpawn({ root, params = {}, now = Date.now() }
     if (config.mode !== job.manifest.metadata.mode) throw new Error("Resume mode does not match the recorded job mode");
     if (JSON.stringify(config.targets) !== JSON.stringify(job.manifest.metadata.targets ?? [])) throw new Error("Resume targets do not match the recorded job targets");
     if (config.sparseCheckout !== Boolean(job.manifest.metadata?.sparseCheckout)) throw new Error("Resume sparseCheckout does not match the recorded job sparseCheckout");
+    const recordedTargets = job.manifest.metadata?.targets ?? [];
+    const recordedSubagents = job.manifest.metadata?.subagents !== undefined
+      ? job.manifest.metadata.subagents
+      : defaultSubagentsForTargets(recordedTargets);
+    if (config.subagents !== recordedSubagents) throw new Error("Resume subagents does not match the recorded job subagents");
     repo = validateRepository(requestedCwd, { requireClean: true, expectedIdentity: job.manifest.metadata.repoIdentity });
     if (repo.repoRoot.toLowerCase() !== path.resolve(job.manifest.cwd).toLowerCase()) throw new Error("Resume workspace does not match the recorded canonical repository");
     if (repo.headSha !== job.manifest.metadata.baseSha) throw new Error("Resume repository HEAD does not match the recorded base commit");
@@ -140,7 +163,7 @@ export async function persistBeforeSpawn({ root, params = {}, now = Date.now() }
 
   const attemptId = generateUuid();
   const executionCwd = worktreePath ?? requestedCwd;
-  const attempt = await createAttempt(stateRoot, job.jobId, { attemptId, attemptIndex, metadata: { isolation: config.isolation, worktreePath, executionCwd, repoRoot: repo?.repoRoot ?? null, repoIdentity: repo?.identity ?? null, baseSha: repo?.headSha ?? job.manifest.metadata?.baseSha ?? null, targets: config.targets, sparseCheckout: config.sparseCheckout, resumeSessionId } }, { now });
+  const attempt = await createAttempt(stateRoot, job.jobId, { attemptId, attemptIndex, metadata: { isolation: config.isolation, worktreePath, executionCwd, repoRoot: repo?.repoRoot ?? null, repoIdentity: repo?.identity ?? null, baseSha: repo?.headSha ?? job.manifest.metadata?.baseSha ?? null, targets: config.targets, sparseCheckout: config.sparseCheckout, subagents: config.subagents, resumeSessionId } }, { now });
   if (config.mode === "accept-edits") await updateAttemptState(stateRoot, job.jobId, attemptId, { artifact: "pending" }, { now });
 
   const prompt = String(params.prompt ?? "");
@@ -160,7 +183,13 @@ export async function getRunContext(root, jobId, attemptId) {
 }
 
 export function buildWorkerPrompt(request, promptText) {
-  return buildFourPillarPrompt({ targets: request.config.targets, action: "Complete only the bounded task described below.", constraints: "Stay inside the assigned workspace and declared targets. No installs, servers, browsers, deployments, commits, pushes, merges, secrets, or unrelated paths unless the task explicitly authorizes them.", verification: "Run only focused checks. Return only the required typed JSON result; worker claims are untrusted until parent verification.", task: promptText });
+  const subagents = Number(request?.config?.subagents ?? request?.subagents ?? 0);
+  let constraints = "Stay inside the assigned workspace and declared targets. No installs, servers, browsers, deployments, commits, pushes, merges, secrets, or unrelated paths unless the task explicitly authorizes them.";
+  if (subagents > 0) {
+    constraints += ` May use at most ${subagents} native subagents, assign disjoint declared-target subsets, no recursive descendants, parent returns one typed result.`;
+  }
+  constraints += " Explicitly prohibit reset --hard, clean -fd/-fdx, overwrite checkout/restore, force push, branch/worktree deletion, canonical .git edits.";
+  return buildFourPillarPrompt({ targets: request?.config?.targets ?? request?.targets ?? [], action: "Complete only the bounded task described below.", constraints, verification: "Run only focused checks. Return only the required typed JSON result; worker claims are untrusted until parent verification.", task: promptText });
 }
 
 export function workerSchemaArgument() { return JSON.stringify(TYPED_RESULT_SCHEMA); }
@@ -235,7 +264,9 @@ export async function completeRun(root, jobId, attemptId, result) {
   let callback = null;
   if (callbackThread) {
     const files = evidence?.manifest?.files ?? [];
-    const fileStat = `${files.length} file(s); artifact=${path.join(attempt.attemptDir, "evidence-manifest.json")}; patch=${evidence?.patchHash?.slice(0, 8) ?? "none"}`;
+    const linesAdded = files.reduce((sum, f) => sum + (Number(f?.linesAdded) || 0), 0);
+    const linesDeleted = files.reduce((sum, f) => sum + (Number(f?.linesDeleted) || 0), 0);
+    const fileStat = `${files.length} file(s); artifact=${path.join(attempt.attemptDir, "evidence-manifest.json")}; patch=${evidence?.patchHash?.slice(0, 8) ?? "none"}; +${linesAdded}/-${linesDeleted}`;
     const message = buildCallbackMessage({ jobId, job: jobId, attempt: attempt.manifest.attemptIndex, execution, artifact: artifactState, claimedChangedPaths: fileStat, summary: typedResult?.summary ?? protocolError ?? "Worker produced no valid result", verification: typedResult?.verification ?? "protocol validation failed" });
     callback = { thread: callbackThread, message };
     await enqueueOutboxRecord(context.root, { jobId, attemptId, payload: callback });

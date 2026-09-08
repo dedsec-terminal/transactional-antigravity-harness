@@ -5,6 +5,7 @@ import path from "node:path";
 import { test } from "node:test";
 
 import {
+  buildWorkerPrompt,
   completeRun,
   exactAsyncResponse,
   getRunContext,
@@ -407,6 +408,103 @@ test("resume must exactly match recorded sparseCheckout and reuse existing workt
     );
 
     await runJobAction(root, "finalize", fullJob.job.jobId);
+  } finally {
+    await fsp.rm(root, { recursive: true, force: true });
+    await fsp.rm(repo, { recursive: true, force: true });
+  }
+});
+
+test("subagents config resolution and prompt constraints", () => {
+  assert.equal(resolveRunConfig({ mode: "plan" }).subagents, 0);
+  assert.equal(resolveRunConfig({ mode: "accept-edits", targets: ["a.txt"] }).subagents, 0);
+  assert.equal(resolveRunConfig({ mode: "accept-edits", targets: ["a.txt", "b.txt"] }).subagents, 0);
+  assert.equal(resolveRunConfig({ mode: "accept-edits", targets: ["a.txt", "b.txt", "c.txt"] }).subagents, 0);
+  assert.equal(resolveRunConfig({ mode: "accept-edits", targets: ["1", "2", "3", "4"] }).subagents, 4);
+  assert.equal(resolveRunConfig({ mode: "accept-edits", targets: ["1", "2", "3", "4", "5"] }).subagents, 4);
+  assert.equal(resolveRunConfig({ mode: "accept-edits", targets: ["a.txt"], subagents: 2 }).subagents, 2);
+  assert.equal(resolveRunConfig({ mode: "accept-edits", targets: ["a.txt"], "--subagents": 0 }).subagents, 0);
+  assert.equal(resolveRunConfig({ mode: "accept-edits", targets: ["a.txt"], subagents: 8 }).subagents, 8);
+  assert.throws(() => resolveRunConfig({ mode: "plan", subagents: -1 }), /--subagents must be an integer from 0 to 8/);
+  assert.throws(() => resolveRunConfig({ mode: "plan", subagents: 9 }), /--subagents must be an integer from 0 to 8/);
+  assert.throws(() => resolveRunConfig({ mode: "plan", subagents: "bad" }), /--subagents must be an integer from 0 to 8/);
+  assert.throws(() => resolveRunConfig({ mode: "plan", subagents: true }), /--subagents must be an integer from 0 to 8/);
+
+  const prompt0 = buildWorkerPrompt({ config: { targets: ["a.txt"], subagents: 0 } }, "task 0");
+  assert.equal(prompt0.includes("native subagents"), false);
+  assert.match(prompt0, /Explicitly prohibit reset --hard, clean -fd\/-fdx, overwrite checkout\/restore, force push, branch\/worktree deletion, canonical \.git edits\./);
+
+  const prompt2 = buildWorkerPrompt({ config: { targets: ["a.txt", "b.txt"], subagents: 2 } }, "task 2");
+  assert.match(prompt2, /May use at most 2 native subagents, assign disjoint declared-target subsets, no recursive descendants, parent returns one typed result\./);
+  assert.match(prompt2, /Explicitly prohibit reset --hard, clean -fd\/-fdx, overwrite checkout\/restore, force push, branch\/worktree deletion, canonical \.git edits\./);
+});
+
+test("subagents metadata persistence, resume match enforcement, and callback linesAdded/Deleted", async () => {
+  const root = await tempRoot("agy-controller-subagents-");
+  const repo = await initRepo();
+  try {
+    const prepared = await persistBeforeSpawn({
+      root,
+      params: { cwd: repo, mode: "accept-edits", targets: ["owned.txt", "pkg/feature.txt"], subagents: 2, prompt: "subagent job", callbackThread: "thread-sub" },
+    });
+    assert.equal(prepared.config.subagents, 2);
+    assert.equal(prepared.job.manifest.metadata?.subagents, 2);
+    assert.equal(prepared.attempt.manifest.metadata?.subagents, 2);
+    const context = await getRunContext(root, prepared.job.jobId, prepared.attempt.attemptId);
+    assert.equal(context.config.subagents, 2);
+
+    await fsp.writeFile(path.join(prepared.executionCwd, "owned.txt"), "before\nadded line\n");
+    const completed = await completeRun(root, prepared.job.jobId, prepared.attempt.attemptId, {
+      exitCode: 0,
+      stdout: terminal({ status: "success", summary: "done", verification: "ok", diagnostics: [], claimedChangedPaths: ["owned.txt"] }),
+      stderr: "",
+      timedOut: false,
+      truncated: false,
+    });
+    assert.match(completed.callback.message, /\+1\/-0/);
+
+    await assert.rejects(
+      persistBeforeSpawn({
+        root,
+        params: { cwd: repo, mode: "accept-edits", targets: ["owned.txt", "pkg/feature.txt"], subagents: 1, prompt: "mismatch", resumeJobId: prepared.job.jobId },
+      }),
+      /Resume subagents does not match the recorded job subagents/,
+    );
+
+    const resumed = await persistBeforeSpawn({
+      root,
+      params: { cwd: repo, mode: "accept-edits", targets: ["owned.txt", "pkg/feature.txt"], subagents: 2, prompt: "match", resumeJobId: prepared.job.jobId },
+    });
+    assert.equal(resumed.attempt.manifest.metadata?.subagents, 2);
+
+    await completeRun(root, prepared.job.jobId, resumed.attempt.attemptId, {
+      exitCode: 0,
+      stdout: terminal({ status: "success", summary: "resumed done", verification: "ok", diagnostics: [], claimedChangedPaths: ["owned.txt"] }, "session-resumed"),
+      stderr: "",
+      timedOut: false,
+      truncated: false,
+    });
+
+    const manifestPath = path.join(root, "jobs", prepared.job.jobId, "manifest.json");
+    const manifest = JSON.parse(await fsp.readFile(manifestPath, "utf8"));
+    delete manifest.metadata.subagents;
+    await fsp.writeFile(manifestPath, JSON.stringify(manifest, null, 2), "utf8");
+
+    await assert.rejects(
+      persistBeforeSpawn({
+        root,
+        params: { cwd: repo, mode: "accept-edits", targets: ["owned.txt", "pkg/feature.txt"], subagents: 2, prompt: "legacy mismatch", resumeJobId: prepared.job.jobId },
+      }),
+      /Resume subagents does not match the recorded job subagents/,
+    );
+
+    const legacyResumed = await persistBeforeSpawn({
+      root,
+      params: { cwd: repo, mode: "accept-edits", targets: ["owned.txt", "pkg/feature.txt"], prompt: "legacy match", resumeJobId: prepared.job.jobId },
+    });
+    assert.equal(legacyResumed.config.subagents, 0);
+    assert.equal(legacyResumed.attempt.manifest.metadata?.subagents, 0);
+
+    await runJobAction(root, "finalize", prepared.job.jobId);
   } finally {
     await fsp.rm(root, { recursive: true, force: true });
     await fsp.rm(repo, { recursive: true, force: true });
