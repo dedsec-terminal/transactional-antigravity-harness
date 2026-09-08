@@ -451,7 +451,7 @@ test("Protocol contract: sparseCheckout schema, description, handler forwarding,
   );
 
   // Both handlers must forward sparseCheckout to delegateArgs
-  const delegateMatches = [...content.matchAll(/delegateArgs\(\s*\{[\s\S]*?sparseCheckout[\s\S]*?\}\s*,\s*promptFile\.file\s*\)/g)];
+  const delegateMatches = [...content.matchAll(/delegateArgs\(\s*\{[\s\S]*?sparseCheckout[\s\S]*?\}\s*,\s*promptFile\.file\s*,?\s*\)/g)];
   assert.equal(delegateMatches.length, 2, "delegateArgs must be called with sparseCheckout in both handlers");
 
   // Serialization to runner: serialize as --sparse-checkout only when true
