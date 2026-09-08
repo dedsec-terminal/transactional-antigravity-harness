@@ -15,36 +15,36 @@ This project provides a transactional execution layer, git worktree isolation, p
 
 The primary agent directs task decomposition, assigns disjoint workspace scopes, and retains sole authority over verifying and merging changes. Delegated work runs in ephemeral worktrees with strict process oversight.
 
-```
-+-------------------------------------------------------------------+
-|                     Codex Orchestrator                            |
-|  - Decomposes tasks & assigns disjoint targets                    |
-|  - Retains verification authority; verifies diffs before applying |
-+-------------------------------------------------------------------+
-             |                                     ^
-       MCP / Stdio                           Codex Queue
-             v                               (Async Callback)
-+--------------------------+                       |
-|   @dedsec-terminal/      |                       |
-|   agy-mcp-server         |                       |
-+--------------------------+                       |
-             |                                     |
-       Child Process                               |
-             v                                     |
-+-------------------------------------------------------------+
-|   Runner Controller (`agy-delegate.mjs`)                    |
-|   - Slot limiting (Max 4 concurrent workers)                |
-|   - NDJSON stdin transport (bypasses Windows CLI limits)    |
-|   - Lease locks & outbox ledger persistence                 |
-+-------------------------------------------------------------+
-             |                                     |
-    Spawns Headless Worker                         |
-             v                                     |
-+------------------------------------+             |
-|   Google Antigravity CLI (`agy`)   |             |
-|   - Runs in isolated Git worktree  |-------------+
-|   - Staged mutations only          |
-+------------------------------------+
+```mermaid
+flowchart TD
+    subgraph Orchestrator["Codex Orchestrator"]
+        A["Task Decomposition & Bounded Prompting"]
+        G["Review Artifacts & Verify Checks"]
+        H["Explicit Apply & Finalize"]
+    end
+
+    subgraph Workers["Disjoint Workers (Max 4 Slots)"]
+        B["Worker 1 (Target A, Worktree)"]
+        C["Worker 2 (Target B, Worktree)"]
+    end
+
+    subgraph EvidenceLayer["Evidence & Ledger"]
+        D["Git Patch, Hashes & Attempt Manifest"]
+        E["Durable Disk Ledger"]
+    end
+
+    subgraph Notification["Reactive Callback"]
+        F["Codex Queue (At-Least-Once Async Notification)"]
+    end
+
+    A -->|"Dispatch agy_delegate_async"| B
+    A -->|"Dispatch agy_delegate_async"| C
+    B -->|"Capture Evidence"| D
+    C -->|"Capture Evidence"| D
+    D -->|"Persist State"| E
+    E -->|"Trigger Notification"| F
+    F -->|"Wakeup (No Polling)"| G
+    G -->|"agy_job apply & finalize"| H
 ```
 
 ---
@@ -62,6 +62,54 @@ The primary agent directs task decomposition, assigns disjoint workspace scopes,
 
 ---
 
+## Performance & Token Architecture
+
+For comprehensive architecture details, isolation models, and engineering guardrails, see [docs/performance.md](docs/performance.md).
+
+### Token-Efficient Task Routing
+
+* **Bounded Prompts**: Atomic tasks constrained by the Four-Pillar prompt format (`TARGETS`, `ACTION`, `CONSTRAINTS`, `VERIFICATION`) eliminate conversational and repo bloat.
+* **Disjoint Concurrency (Max 4 Workers)**: Up to 4 parallel workers (`MAX_WORKER_SLOTS = 4`) target non-overlapping file paths or directory prefixes to prevent collision and rework tokens.
+* **Async Callbacks (No Polling)**: `codex queue` reactive notification wakes the orchestrator; no busy-polling loops (`agy_job status`) consuming tokens and API turns.
+* **Shared Read-Only Plan vs Worktree Mutation**: Only synchronous planning (`agy_delegate` with `mode: "plan"`) defaults to `isolation: "shared"`, which relies on trusted read-only instructions rather than an OS-level sandbox. Asynchronous planning and mutating edits (`mode: "accept-edits"`) strictly isolate in git worktrees.
+* **Exact-Session Correction Loop (`resumeJobId`)**: Passing `resumeJobId` reconnects directly to the existing worktree and reuses the recorded conversation session (`--conversation <sessionId>`), requiring a saved session ID; it does not guarantee cached-token savings or eliminate repository reindexing.
+
+```mermaid
+flowchart TD
+    subgraph Orchestrator["Codex Orchestrator"]
+        O1["Parent Verification Finds Discrepancy"]
+        O2["Formulate Targeted Correction Prompt"]
+        O3["Verify Attempt N+1 Artifact"]
+    end
+
+    subgraph Harness["Transactional Controller"]
+        H1["Validate resumeJobId & Canonical Identity"]
+        H2["Verify Worktree & Recorded Session ID"]
+        H3["Spawn agy with --conversation sessionId"]
+        H4["Record Attempt N+1 Manifest & Patch"]
+    end
+
+    subgraph Execution["Existing Worktree"]
+        W1["Worker Incremental Correction (Attempt N+1)"]
+    end
+
+    O1 --> O2
+    O2 -->|"agy_delegate(resumeJobId)"| H1
+    H1 --> H2
+    H2 --> H3
+    H3 --> W1
+    W1 --> H4
+    H4 -->|"Callback / Result"| O3
+```
+
+### Architectural Lineage & Realities
+
+* **Disk & Context Isolation**: Combines disk-isolated checkouts ([Cursor Worktrees](https://cursor.com/docs/configuration/worktrees)) and separate focused context windows ([Claude Code Sub-agents](https://code.claude.com/docs/en/sub-agents)) with hash-verified artifact validation.
+* **Grounded Performance**: Worktree creation involves standard OS filesystem operations rather than "zero I/O". There are no guaranteed speedups, token savings, or delivery guarantees; operational benefits depend on task decomposition and parallel execution.
+* **Engineering Guardrails**: Opt-in sparse checkout remains an experimental proposal pending verification (with no guarantee that all source is required for all checks); durable disk ledgers are retained for crash safety and reconciliation without RAM-only defaults or failover authority expansion; and the MCP embedded controller is deferred until empirical measurements justify lifecycle changes.
+
+---
+
 ## Safety & Lifecycle Model
 
 1. **Trusted Headless Execution Boundary**: The runner executes `agy` with `--dangerously-skip-permissions` to allow unattended execution in non-interactive environments. Never delegate credentials, secrets, destructive shell commands, or deployments without separate user approval.
@@ -69,6 +117,7 @@ The primary agent directs task decomposition, assigns disjoint workspace scopes,
 3. **Explicit Apply & Finalize**: Completed worktree changes are never merged automatically. The parent orchestrator reviews the patch hash, applies verified changes, and cleans up the worktree.
 4. **Path Traversal Protection**: Target paths are constrained to the workspace root; directory traversal (`..`) attempts outside the workspace are rejected.
 5. **Retention Policies**:
+
    * **Worktrees**: Retained for 24 hours (1,440 minutes by default) to allow manual inspection and debugging before disposal.
    * **Evidence Ledger**: Job logs, terminal events, and hashes are kept for 14 days for forensic traceability.
 
@@ -109,7 +158,9 @@ The pre-built MCP server is published to **GitHub Packages** as `@dedsec-termina
 > **Registry Distinction**: **GitHub Packages** (`npm.pkg.github.com`) is a package registry for hosting software packages, distinct from **GitHub Marketplace** (which distributes GitHub Actions and GitHub Apps).
 
 #### Authentication & PAT Security
+
 Installing from `npm.pkg.github.com` requires authentication with a GitHub **classic Personal Access Token (PAT)** with the `read:packages` scope:
+
 * **Configure safely**: Store the token in your user-level configuration (`~/.npmrc`) or provide it via the `NODE_AUTH_TOKEN` environment variable.
 * **Never commit secrets**: Never commit your PAT, tokens, or credential-bearing `.npmrc` files to version control or repository trees.
 
@@ -179,6 +230,7 @@ Preflight check to verify that the runner, `agy` executable, and Codex callback 
 Synchronously delegates a bounded task to Antigravity and waits for the result.
 
 **Parameters**:
+
 * `prompt` (string, required): Bounded task description.
 * `cwd` (string, required): Absolute path to the workspace root.
 * `mode` (`"plan"` | `"accept-edits"`, default `"accept-edits"`): Task execution mode.
@@ -203,6 +255,7 @@ Synchronously delegates a bounded task to Antigravity and waits for the result.
 Dispatches a background worker task and returns an immediate acknowledgement. When complete, notifies the designated Codex thread.
 
 **Parameters**: All parameters from `agy_delegate`, plus:
+
 * `notifyThread` (string, required): Single-line Codex thread identifier (max 200 characters) to wake upon completion.
 
 ```json
@@ -221,6 +274,7 @@ Dispatches a background worker task and returns an immediate acknowledgement. Wh
 Inspects or manages the lifecycle of transactional jobs.
 
 **Parameters**:
+
 * `action` (`"status"` | `"list"` | `"cancel"` | `"reconcile"` | `"apply"` | `"finalize"`, required): The job action to execute.
 * `jobId` (string, required for all actions except `"list"` and `"reconcile"`): The UUID of the job.
 * `args` (object, optional): Additional parameters for specific actions (such as artifact hash validation for `"apply"`).
