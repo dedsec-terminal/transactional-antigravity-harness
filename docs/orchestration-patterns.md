@@ -7,7 +7,7 @@ Assessment of orchestration patterns referenced in user-supplied Grok Build v1.0
 ### Adopt Now
 
 * **Dynamic Load-Aware Capacity**: Adapt worker concurrency based on host load; design status is in progress with no claimed speedup.
-* **Actual Bounded Result Callbacks**: Already present via reactive async dispatch (`codex queue`) returning typed evidence manifests.
+* **Actual Bounded Result Callbacks**: Already present via reactive async dispatch (`codex queue`); callbacks carry a bounded completion summary plus durable artifact references.
 * **Exact Attempt Continuation**: Already present via `resumeJobId` preserving recorded session state and worktrees.
 * **Destructive-Git Prompt Hardening**: Constrain worker prompts against destructive git commands (`git reset --hard`, unauthorized branch changes).
 * **Line-Aware Diff Summary**: Compact diff summaries detailing modified line counts per target to limit token overhead.
