@@ -20,7 +20,7 @@ async function appendJobActivity(stateRoot, jobId, event) {
   } catch {}
 }
 
-export const VERSION = "1.0.0";
+export const VERSION = "1.1.0";
 export const DEFAULT_TIMEOUT_SECONDS = 300;
 
 export function sanitizeLine(value, fallback = "") {

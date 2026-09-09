@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.1.0] - 2026-09-10
+
+### Added
+- Opt-in sparse checkout.
+- Adaptive CPU/memory pre-spawn reservations (hardmax 8).
+- Safe bounded activity through agy_job.
+- Bounded native subagent prompt controls.
+- Callback added/deleted line counts.
+- Mermaid/sourced architecture docs.
+- Note: Native Codex cards not provided and no measured speedup claim.
+
 ## [1.0.0] - 2026-09-08
 
 ### Added
@@ -23,5 +34,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 - Project-registration pollution fix preventing cross-task state leaks.
 
-[Unreleased]: https://github.com/dedsec-terminal/transactional-antigravity-harness/compare/v1.0.0...HEAD
+[Unreleased]: https://github.com/dedsec-terminal/transactional-antigravity-harness/compare/v1.1.0...HEAD
+[1.1.0]: https://github.com/dedsec-terminal/transactional-antigravity-harness/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/dedsec-terminal/transactional-antigravity-harness/releases/tag/v1.0.0

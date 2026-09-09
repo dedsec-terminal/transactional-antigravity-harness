@@ -1,6 +1,6 @@
 {
   "name": "@dedsec-terminal/agy-mcp-server",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Model Context Protocol (MCP) server for transactional Antigravity CLI delegation and task execution",
   "license": "MIT",
   "repository": {

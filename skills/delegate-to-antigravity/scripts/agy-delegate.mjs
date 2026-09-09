@@ -31,7 +31,7 @@ import {
 import { queryProcessIdentity } from "./lib/windows-process.mjs";
 import { createBoundedStreamCollector } from "./lib/storage.mjs";
 
-const VERSION = "1.0.0";
+const VERSION = "1.1.0";
 const MAX_OUTPUT_BYTES = 2 * 1024 * 1024;
 const MAX_PROMPT_CHARS = 100_000;
 const DEFAULT_TIMEOUT_SECONDS = 300;

@@ -1,6 +1,6 @@
 {
   "name": "antigravity-subagent",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Delegate bounded tasks from Codex to Google Antigravity CLI through a skill or MCP tools.",
   "author": {
     "name": "Swaraj Singh"

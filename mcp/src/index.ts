@@ -11,7 +11,7 @@ import { McpServer } from '@modelcontextprotocol/server';
 import { serveStdio } from '@modelcontextprotocol/server/stdio';
 import * as z from 'zod/v4';
 
-const VERSION = '1.0.0';
+const VERSION = '1.1.0';
 const MAX_OUTPUT_BYTES = 2 * 1024 * 1024;
 const DEFAULT_TIMEOUT_SECONDS = 300;
 const RUNNER_GRACE_MS = 10_000;
