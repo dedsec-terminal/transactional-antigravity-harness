@@ -17,7 +17,7 @@ The bypass trusts the delegated prompt and workspace. Never delegate secrets, cr
 
 1. **Check first:** Run `agy_check` before the first delegation.
 2. **Sub-25s single-yield rule:** Size each atomic task to finish in under 25 seconds so it normally returns on the first 30-second yield. This is a sizing target, never a process cutoff. Set `timeoutSeconds` to 180–300 seconds; never set it to 25.
-3. **Disjoint parallel fan-out:** When work touches two or more files, dispatch concurrent `agy_delegate` calls with explicit `targets` specifying non-overlapping workspace-relative paths or directory prefixes. Bound concurrency to a maximum of four slots (`MAX_WORKER_SLOTS = 4`). Tell every worker that it is not alone and must preserve others' edits.
+3. **Disjoint parallel fan-out:** When work touches two or more files, dispatch concurrent `agy_delegate` calls with explicit `targets` specifying non-overlapping workspace-relative paths or directory prefixes. Bound concurrency using adaptive CPU and memory admission with a hard maximum of eight slots (`AGY_WORKER_MAX`, 1..8) and zero new admissions under resource pressure. Tell every worker that it is not alone and must preserve others' edits.
 4. **Worktree isolation:** Use `isolation: "worktree"` (the default for mutating `accept-edits` and async tasks). Synchronous `plan` defaults to `shared` isolation. Explicit `shared` isolation combined with `accept-edits` or async execution is unsafe and rejected.
 5. **Async reactive callback:** Use `agy_delegate_async`, or the runner with `--async --notify-thread <thread-id>`, for longer independent work. Dispatch once, end the Codex turn, and let `codex queue` wake the task; do not poll. Callbacks operate with at-least-once delivery separation; the callback signals readiness to inspect artifacts, not completion of parent verification.
 6. **Prompt transport:** Put complete prompts in UTF-8 files for the CLI runner. The runner sends them to Antigravity as NDJSON over stdin, avoiding the Windows command-line limit.
@@ -33,7 +33,7 @@ Transactional execution isolates mutations and tracks execution state:
   - Asynchronous execution or mutating `accept-edits`: defaults to `worktree` isolation.
   - Explicit `shared` isolation for mutating (`accept-edits`) or `async` tasks is rejected as an unsafe combination.
 - **Sparse checkout (`sparseCheckout`, default `false`):** Explicit opt-in for Git cone sparse worktree checkout (CLI `--sparse-checkout`; default is full checkout). Cone behavior: selecting a tracked file expands to its parent directory siblings; root files are present; unrelated subtrees are absent. Targets must exist at base commit, so use an existing parent directory target when creating new files. Recommend only for bounded self-contained edits; prefer full checkout for repo-wide or cross-module checks. Measured speedup is not yet claimed. Safety caveat: omitting unrelated subtrees can break cross-module type checking, imports, or repo-wide test suites if unselected dependencies are required.
-- **Four concurrency slots:** Harness limits active workers to four concurrent slots (`MAX_WORKER_SLOTS = 4`) to prevent workspace and CPU exhaustion.
+- **Adaptive concurrency admission:** Harness limits active workers using adaptive CPU and memory admission with a hard maximum of eight slots (`AGY_WORKER_MAX`, 1..8), admitting zero new workers under resource pressure. Capacity environment variables include `AGY_WORKER_SLOTS`, `AGY_WORKER_MIN`, `AGY_WORKER_MAX` (1..8), `AGY_WORKER_MEMORY_MB` (default 1536), and `AGY_WORKER_CPU_HIGH_PERCENT` (default 90); overrides still obey resource pressure.
 - **Explicit apply/finalize:** Worker changes produced in a worktree are staged in isolation. The parent orchestrator inspects the diff/artifact and must explicitly apply or finalize changes. No changes are merged automatically.
 - **Job resumption (`resumeJobId`) & No `--continue`:** Headless transactional execution does not use `--continue` or `--resume`. To continue correction work, provide `resumeJobId`; the harness validates the exact recorded worktree/session and invokes AGY with `--conversation <recorded-id>` for immutable attempt N+1.
 - **No Antigravity project registration:** New runs intentionally omit `--new-project`, so one-shot delegations do not add permanent UUID project files to Antigravity Desktop.
@@ -48,6 +48,7 @@ Transactional execution isolates mutations and tracks execution state:
   - `reconcile`: Reclaim verified stale/orphan leases and retry due callback records.
   - `apply`: Explicitly apply a hash-verified artifact while preserving unrelated changes and the canonical index.
   - `finalize`: Remove only a verified harness-owned worktree and retain durable evidence.
+  - `activity`: Inspect safe lifecycle events for a `jobId` with optional `args.limit` (default 50, max 100); reads safe lifecycle only. Installed old cached plugins must be updated before using new controls.
 
 ## Typed worker and lean callback contracts
 
@@ -95,6 +96,18 @@ agy_delegate_async({
 ```
 
 Supported modes are `plan` and `accept-edits`; the default is `accept-edits`. The accepted timeout range is 1–1800 seconds, but normal delegated work must use 180–300 seconds. Optional transactional parameters include `targets` (list of paths/prefixes), `isolation` (`worktree` | `shared`), `sparseCheckout` (boolean, default `false`, opt-in Git cone sparse checkout), `resumeJobId` (job ID to resume), and `retentionMinutes` (defaults to 1440 for 24h worktree retention). Safety caveat: `sparseCheckout` omits unselected subtrees; use only for self-contained edits and prefer full checkout for repo-wide or cross-module verification.
+
+Inspect safe lifecycle activity:
+
+```text
+agy_job({
+  action: "activity",
+  jobId: "<job-id>",
+  args: { limit: 50 } // optional: default 50, max 100; reads safe lifecycle only
+})
+```
+
+Installed old cached plugins must be updated before using new controls. Capacity environment variables (`AGY_WORKER_SLOTS`, `AGY_WORKER_MIN`, `AGY_WORKER_MAX` [1..8], `AGY_WORKER_MEMORY_MB` [default 1536], `AGY_WORKER_CPU_HIGH_PERCENT` [default 90]) govern worker concurrency; overrides still obey resource pressure.
 
 ## Bundled runner
 

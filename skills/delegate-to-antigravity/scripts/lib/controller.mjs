@@ -6,7 +6,7 @@ import { createJob, createAttempt, getJob, getAttempt, getAttemptDir, getJobDir,
 import { DEFAULT_RETENTION_MINUTES, TYPED_RESULT_SCHEMA, buildFourPillarPrompt, buildCallbackMessage, normalizeTargets, parseTypedResult, resolveIsolation } from "./contracts.mjs";
 import { enqueueOutboxRecord, getPendingOutboxRecords, listOutboxRecords, recordOutboxFailure, recordOutboxSuccess } from "./outbox.mjs";
 import { acquireSlot, activateReservedSlot, getActiveCount, getCounts, reclaimLeases, releaseSlot, reserveSlot } from "./leases.mjs";
-import { sampleSystemCapacity, recommendWorkerCapacity } from "./system-capacity.mjs";
+import { sampleSystemCapacity, recommendWorkerCapacity, DEFAULT_MAX_WORKERS } from "./system-capacity.mjs";
 import { appendActivityEvent, readActivityEvents } from "./activity.mjs";
 import { createWorktree, finalizeWorktree, validateRepository, verifyWorktreeOwnership } from "./git-worktree.mjs";
 import { captureEvidence } from "./evidence.mjs";
@@ -211,7 +211,7 @@ export async function reserveWorker(root, jobId, attemptId, controllerIdentity, 
   const attemptDir = getAttemptDir(stateRoot, jobId, attemptId);
   const activeWorkers = options.activeWorkers !== undefined
     ? options.activeWorkers
-    : await (options.getActiveCount ?? getActiveCount)({ stateRoot, maxSlots: 8 });
+    : await (options.getActiveCount ?? getActiveCount)({ stateRoot, maxSlots: DEFAULT_MAX_WORKERS });
 
   const sampler = options.sampleSystemCapacity ?? sampleSystemCapacity;
   const sample = typeof sampler === "function"
@@ -456,7 +456,7 @@ async function listJobs(stateRoot) {
 }
 
 async function reconcileJobs(stateRoot, options = {}) {
-  const leases = await reclaimLeases({ stateRoot });
+  const leases = await reclaimLeases({ stateRoot, maxSlots: DEFAULT_MAX_WORKERS });
   const callbackResults = options.sender ? await retryOutbox(stateRoot, options.sender) : [];
   const recovered = [];
   for (const summary of await listJobs(stateRoot)) {
@@ -483,11 +483,11 @@ export async function runJobAction(root, action, jobId, options = {}) {
   }
   if (action === "activity") {
     const requestedLimit = Number(options.limit ?? 50);
-    if (!Number.isInteger(requestedLimit) || requestedLimit < 1 || requestedLimit > 200) {
-      throw new Error("activity limit must be an integer from 1 to 200");
+    if (!Number.isInteger(requestedLimit) || requestedLimit < 1 || requestedLimit > 100) {
+      throw new Error("activity limit must be an integer from 1 to 100");
     }
-    const events = await readActivityEvents(getJobDir(stateRoot, jobId));
-    return { action, jobId, events: events.slice(-requestedLimit) };
+    const events = await readActivityEvents(getJobDir(stateRoot, jobId), { limit: requestedLimit });
+    return { action, jobId, events };
   }
   if (action === "reconcile") return reconcileJobs(stateRoot, options);
   if (action === "cancel") {
@@ -538,7 +538,7 @@ export async function runJobAction(root, action, jobId, options = {}) {
 
 export async function healthSnapshot(root) {
   const stateRoot = resolveAgyRoot(root);
-  const [storage, slots, outbox] = await Promise.all([checkStorageHealth(stateRoot), getCounts({ stateRoot }), listOutboxRecords(stateRoot)]);
+  const [storage, slots, outbox] = await Promise.all([checkStorageHealth(stateRoot), getCounts({ stateRoot, maxSlots: DEFAULT_MAX_WORKERS }), listOutboxRecords(stateRoot)]);
   return { ledger: storage, activeSlots: slots.activeCount, availableSlots: slots.availableCount, orphanCount: slots.orphanCount ?? 0, callbackBacklog: outbox.filter((record) => record.status === "pending").length, pendingPruneCount: 0 };
 }
 

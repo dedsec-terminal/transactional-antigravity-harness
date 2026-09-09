@@ -393,17 +393,17 @@ if (options.check) {
     ...(capacity
       ? {
           capacity,
-          workerCapacity: capacity,
           recommendedSlots: capacity.recommendedSlots,
           availableSlots: capacity.availableSlots,
           maxWorkers: DEFAULT_MAX_WORKERS,
         }
       : {
           capacity: null,
-          workerCapacity: null,
           maxWorkers: DEFAULT_MAX_WORKERS,
         }),
     stateRoot: process.env.AGY_STATE_ROOT || null,
+    // Preserved for compatibility: health.availableSlots means physical lease capacity,
+    // top-level availableSlots is load admission.
     health,
   };
   process.stdout.write(`${JSON.stringify(checkPayload)}\n`);

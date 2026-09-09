@@ -23,7 +23,7 @@ flowchart TD
         H["Explicit Apply & Finalize"]
     end
 
-    subgraph Workers["Disjoint Workers (Max 4 Slots)"]
+    subgraph Workers["Disjoint Workers (Adaptive Admission, Hard Max 8)"]
         B["Worker 1 (Target A, Worktree)"]
         C["Worker 2 (Target B, Worktree)"]
     end
@@ -55,7 +55,7 @@ flowchart TD
   * **Synchronous (`agy_delegate`)**: Quick turnaround for bounded single-file edits, reviews, or plans.
   * **Asynchronous (`agy_delegate_async`)**: Background task dispatch with reactive completion notification via `codex queue` to avoid busy-polling.
 * **Transactional Worktree Isolation**: Mutating tasks (`accept-edits`) run in isolated ephemeral git worktrees by default (`isolation: "worktree"`), with optional Git cone sparse checkout (`sparseCheckout: true`, CLI `--sparse-checkout`). Canonical repository files remain clean until changes are validated.
-* **Bounded Parallel Fan-out**: Up to 4 parallel workers (`MAX_WORKER_SLOTS = 4`) targeting non-overlapping file paths or directory prefixes.
+* **Adaptive Parallel Fan-out**: Parallel workers target non-overlapping file paths or directory prefixes. Concurrency uses adaptive CPU and memory admission with a hard maximum of 8 workers (`AGY_WORKER_MAX`, 1..8) and zero new admissions under resource pressure. Configurable via `AGY_WORKER_SLOTS`, `AGY_WORKER_MIN`, `AGY_WORKER_MAX` (1..8), `AGY_WORKER_MEMORY_MB` (default 1536), and `AGY_WORKER_CPU_HIGH_PERCENT` (default 90); overrides still obey resource pressure.
 * **Windows & POSIX Process Stability**: Stdin NDJSON prompt delivery avoids Windows command-line character limits. Process tree teardowns use `taskkill /PID /T /F` on Windows and `SIGTERM` process groups on POSIX.
 * **Complete Job Lifecycle Management (`agy_job`)**: Inspect job status, list attempts, cancel active workers, reconcile stale leases, and explicitly apply or finalize changes.
 * **Lean, Typed Output Contract**: Workers report status through a strict JSON schema (`status`, `summary`, `verification`, `claimedChangedPaths`). Callbacks return a compact three-line report instead of noisy raw diffs.
@@ -69,7 +69,7 @@ For comprehensive architecture details, isolation models, and engineering guardr
 ### Token-Efficient Task Routing
 
 * **Bounded Prompts**: Atomic tasks constrained by the Four-Pillar prompt format (`TARGETS`, `ACTION`, `CONSTRAINTS`, `VERIFICATION`) eliminate conversational and repo bloat.
-* **Disjoint Concurrency (Max 4 Workers)**: Up to 4 parallel workers (`MAX_WORKER_SLOTS = 4`) target non-overlapping file paths or directory prefixes to prevent collision and rework tokens.
+* **Disjoint Concurrency & Adaptive Admission**: Parallel workers target non-overlapping file paths or directory prefixes to prevent collision and rework tokens. Concurrency uses adaptive CPU and memory admission with a hard maximum of 8 workers (zero new admissions under resource pressure), configurable via `AGY_WORKER_SLOTS`, `AGY_WORKER_MIN`, `AGY_WORKER_MAX` (1..8), `AGY_WORKER_MEMORY_MB` (default 1536), and `AGY_WORKER_CPU_HIGH_PERCENT` (default 90); overrides still obey resource pressure.
 * **Async Callbacks (No Polling)**: `codex queue` reactive notification wakes the orchestrator; no busy-polling loops (`agy_job status`) consuming tokens and API turns.
 * **Shared Read-Only Plan vs Worktree Mutation**: Only synchronous planning (`agy_delegate` with `mode: "plan"`) defaults to `isolation: "shared"`, which relies on trusted read-only instructions rather than an OS-level sandbox. Asynchronous planning and mutating edits (`mode: "accept-edits"`) strictly isolate in git worktrees.
 * **Exact-Session Correction Loop (`resumeJobId`)**: Passing `resumeJobId` reconnects directly to the existing worktree and reuses the recorded conversation session (`--conversation <sessionId>`), requiring a saved session ID; it does not guarantee cached-token savings or eliminate repository reindexing.
@@ -277,9 +277,9 @@ Inspects or manages the lifecycle of transactional jobs.
 
 **Parameters**:
 
-* `action` (`"status"` | `"list"` | `"cancel"` | `"reconcile"` | `"apply"` | `"finalize"`, required): The job action to execute.
+* `action` (`"status"` | `"list"` | `"cancel"` | `"reconcile"` | `"apply"` | `"finalize"` | `"activity"`, required): The job action to execute.
 * `jobId` (string, required for all actions except `"list"` and `"reconcile"`): The UUID of the job.
-* `args` (object, optional): Additional parameters for specific actions (such as artifact hash validation for `"apply"`).
+* `args` (object, optional): Additional parameters for specific actions (such as artifact hash validation for `"apply"`, or `limit` [default 50, max 100] for `"activity"`).
 
 ```json
 {
@@ -359,7 +359,7 @@ npm run test:protocol
 
 ## Limitations
 
-* **Concurrency Limit**: Capped at 4 concurrent worker processes to avoid CPU and workspace exhaustion.
+* **Concurrency Limit**: Governed by adaptive CPU and memory admission with a hard maximum of 8 workers (`AGY_WORKER_MAX`, 1..8) and zero new admissions under resource pressure to prevent CPU and workspace exhaustion.
 * **Non-Interactive Permissions**: The harness uses `--dangerously-skip-permissions` because headless background workers cannot answer interactive terminal prompts.
 * **No Auto-Merge**: Git mutations are isolated in worktrees and never committed to primary working branches automatically.
 * **Task Sizing**: Tasks should be scoped to finish in under 25 seconds for snappy multi-agent orchestration, though timeouts can be configured up to 300 seconds (or 1800 seconds max).
