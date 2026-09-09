@@ -35,7 +35,7 @@
     "check": "tsc --noEmit",
     "prepack": "npm run build && node scripts/package-assets.mjs prepare",
     "postpack": "node scripts/package-assets.mjs clean",
-    "test": "node test/ledger-outbox.mjs && node test/process-leases.mjs && node test/contracts.mjs && node test/git-artifacts.mjs && node test/sparse-worktree.mjs && node test/runner-controller.mjs && node test/smoke.mjs --protocol-only && node test/deterministic.mjs",
+    "test": "node test/system-capacity.mjs && node test/activity.mjs && node test/ledger-outbox.mjs && node test/process-leases.mjs && node test/contracts.mjs && node test/git-artifacts.mjs && node test/sparse-worktree.mjs && node test/runner-controller.mjs && node test/smoke.mjs --protocol-only && node test/deterministic.mjs",
     "test:protocol": "node test/smoke.mjs --protocol-only",
     "test:live": "node test/smoke.mjs"
   },

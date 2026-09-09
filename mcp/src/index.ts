@@ -405,9 +405,9 @@ function createServer(): McpServer {
 
   server.registerTool('agy_job', {
     title: 'Manage Antigravity Job',
-    description: 'Inspect or transition a transactional Antigravity job.',
+    description: 'Inspect or transition a transactional Antigravity job, or view bounded safe lifecycle events via args.limit (default50).',
     inputSchema: z.object({
-      action: z.enum(['status', 'list', 'cancel', 'reconcile', 'apply', 'finalize']),
+      action: z.enum(['status', 'list', 'cancel', 'reconcile', 'apply', 'finalize', 'activity']),
       jobId: z.string().min(1).max(200).optional(),
       args: z.record(z.string(), z.unknown()).optional(),
     }),
