@@ -7,7 +7,7 @@ import { DEFAULT_RETENTION_MINUTES, TYPED_RESULT_SCHEMA, buildFourPillarPrompt, 
 import { enqueueOutboxRecord, getPendingOutboxRecords, listOutboxRecords, recordOutboxFailure, recordOutboxSuccess } from "./outbox.mjs";
 import { acquireSlot, activateReservedSlot, getActiveCount, getCounts, reclaimLeases, releaseSlot, reserveSlot } from "./leases.mjs";
 import { sampleSystemCapacity, recommendWorkerCapacity } from "./system-capacity.mjs";
-import { appendActivityEvent } from "./activity.mjs";
+import { appendActivityEvent, readActivityEvents } from "./activity.mjs";
 import { createWorktree, finalizeWorktree, validateRepository, verifyWorktreeOwnership } from "./git-worktree.mjs";
 import { captureEvidence } from "./evidence.mjs";
 import { applyPatch } from "./apply.mjs";
@@ -480,6 +480,14 @@ export async function runJobAction(root, action, jobId, options = {}) {
   if (action === "status") {
     const attempts = await listAttempts(stateRoot, jobId);
     return { action, jobId, manifest: job.manifest, state: job.state, attempts: attempts.map((attempt) => ({ attemptId: attempt.attemptId, attemptIndex: attempt.manifest?.attemptIndex, state: attempt.state, artifactPaths: attempt.attemptDir ? { result: path.join(attempt.attemptDir, "result.json"), manifest: path.join(attempt.attemptDir, "evidence-manifest.json"), patch: path.join(attempt.attemptDir, "changes.patch") } : null })) };
+  }
+  if (action === "activity") {
+    const requestedLimit = Number(options.limit ?? 50);
+    if (!Number.isInteger(requestedLimit) || requestedLimit < 1 || requestedLimit > 200) {
+      throw new Error("activity limit must be an integer from 1 to 200");
+    }
+    const events = await readActivityEvents(getJobDir(stateRoot, jobId));
+    return { action, jobId, events: events.slice(-requestedLimit) };
   }
   if (action === "reconcile") return reconcileJobs(stateRoot, options);
   if (action === "cancel") {
