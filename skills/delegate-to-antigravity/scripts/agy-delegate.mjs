@@ -16,6 +16,7 @@ import {
   markCallbackDelivered,
   markCallbackFailed,
   persistBeforeSpawn,
+  parseTerminalResult as parseTerminalEvent,
   recordWorkerSpawn,
   releaseWorker,
   reserveWorker,
@@ -28,6 +29,7 @@ import {
   recommendWorkerCapacity,
   sampleSystemCapacity,
 } from "./lib/system-capacity.mjs";
+import { terminateOwnedProcessTree as terminateProcessTree } from "./lib/owned-process.mjs";
 import { queryProcessIdentity } from "./lib/windows-process.mjs";
 import { createBoundedStreamCollector } from "./lib/storage.mjs";
 
@@ -165,17 +167,6 @@ async function findCodex() {
   return undefined;
 }
 
-function terminateProcessTree(child) {
-  if (!child?.pid) return;
-  if (process.platform === "win32") {
-    spawnSync("taskkill", ["/PID", String(child.pid), "/T", "/F"], {
-      windowsHide: true,
-      stdio: "ignore",
-    });
-  } else {
-    child.kill("SIGTERM");
-  }
-}
 
 function installSignalHandlers() {
   for (const [signal, exitCode] of [["SIGINT", 130], ["SIGTERM", 143]]) {
@@ -194,6 +185,7 @@ function run(command, args, cwd, timeoutMs, stdinText, onSpawn) {
       cwd,
       env: process.env,
       windowsHide: true,
+      detached: process.platform !== "win32",
       stdio: ["pipe", "pipe", "pipe"],
     });
     activeChild = child;
@@ -262,17 +254,7 @@ async function stableProcessIdentity(pid) {
 }
 
 function parseTerminalResult(stdout) {
-  let terminal;
-  for (const line of stdout.split(/\r?\n/)) {
-    if (!line.trim()) continue;
-    try {
-      const event = JSON.parse(line);
-      if (event?.event === "result" && event.result) terminal = event.result;
-    } catch {
-      // Ignore non-JSON progress lines; the terminal result is authoritative.
-    }
-  }
-  return terminal;
+  return parseTerminalEvent(stdout)?.result;
 }
 
 function sanitizeLine(value, fallback) {
@@ -384,7 +366,7 @@ if (options.check) {
     // Keep --check available even if capacity sampling or recommendation fails.
   }
   const checkPayload = {
-    available: true,
+    available: !health.error && health.ledger?.healthy === true,
     executable,
     runnerVersion: VERSION,
     codexCallbackAvailable: Boolean(codex),
@@ -468,7 +450,7 @@ if (context.request.resumeSessionId) {
   agyArgs.push("--conversation", context.request.resumeSessionId);
 }
 if (options.agent) agyArgs.push("--agent", options.agent);
-agyArgs.push("--model", options.model || "gemini-3.8-flash-high");
+if (options.model) agyArgs.push("--model", options.model);
 
 let result;
 try {

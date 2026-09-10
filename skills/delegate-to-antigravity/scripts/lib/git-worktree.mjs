@@ -374,8 +374,9 @@ export async function acquireCommonDirLock(commonDir, options = {}) {
             await handle.close();
           } catch {}
           try {
-            await fsp.unlink(lockPath);
-          } catch {}
+            const current = JSON.parse(await fsp.readFile(lockPath, "utf8"));
+            if (current.token === token) await fsp.unlink(lockPath);
+          } catch { /* Preserve locks whose ownership cannot be verified. */ }
         },
       };
     } catch (err) {

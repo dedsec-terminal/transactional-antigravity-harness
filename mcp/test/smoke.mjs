@@ -2,6 +2,8 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import fsp from 'node:fs/promises';
 import path from 'node:path';
+import os from 'node:os';
+import { createJob, createAttempt } from '../../skills/delegate-to-antigravity/scripts/lib/ledger.mjs';
 import { fileURLToPath } from 'node:url';
 
 import { Client } from '@modelcontextprotocol/client';
@@ -31,7 +33,8 @@ if (callbackLog) {
   process.env.AGY_MCP_TEST_CALLBACK_FILE = callbackLog;
 }
 
-const transport = new StdioClientTransport({ command: process.execPath, args: serverArgs, env: process.env });
+const protocolStateRoot = protocolOnly ? await fsp.mkdtemp(path.join(os.tmpdir(), 'agy-protocol-state-')) : null;
+const transport = new StdioClientTransport({ command: process.execPath, args: serverArgs, env: { ...process.env, ...(protocolStateRoot ? { AGY_STATE_ROOT: protocolStateRoot } : {}) } });
 const client = new Client({ name: 'agy-mcp-smoke-test', version: '1.0.0' });
 
 try {
@@ -59,6 +62,21 @@ try {
   assert.equal(asyncTool.inputSchema.properties.subagents.minimum, 0);
   assert.equal(asyncTool.inputSchema.properties.subagents.maximum, 8);
   assert.ok(asyncTool.inputSchema.required.includes('notifyThread'));
+
+  if (protocolOnly) {
+    const job = await createJob(protocolStateRoot, { prompt: 'protocol fixture' });
+    const attempt = await createAttempt(protocolStateRoot, job.jobId);
+    const status = await client.callTool({ name: 'agy_job', arguments: { action: 'status', jobId: job.jobId } });
+    assert.notEqual(status.isError, true);
+    assert.equal(status.structuredContent.state.lifecycle, 'running');
+    assert.equal(status.structuredContent.attempts[0].attemptId, attempt.attemptId);
+    assert.equal(status.structuredContent.attempts[0].artifactPaths.patch, path.join(attempt.attemptDir, 'changes.patch'));
+    const list = await client.callTool({ name: 'agy_job', arguments: { action: 'list' } });
+    assert.notEqual(list.isError, true);
+    assert.equal(list.structuredContent.jobs.length, 1);
+    const cancel = await client.callTool({ name: 'agy_job', arguments: { action: 'cancel', jobId: job.jobId } });
+    assert.equal(cancel.structuredContent.reason, 'no_active_worker');
+  }
 
   if (!protocolOnly) {
     const check = await client.callTool({ name: 'agy_check', arguments: {} });
@@ -175,4 +193,5 @@ try {
   console.error('MCP smoke test passed');
 } finally {
   await client.close();
+  if (protocolStateRoot) await fsp.rm(protocolStateRoot, { recursive: true, force: true });
 }

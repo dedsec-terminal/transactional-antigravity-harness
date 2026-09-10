@@ -17,8 +17,8 @@ export const DEFAULT_ISOLATION = Object.freeze({
 
 export const DEFAULT_RETENTION_MINUTES = 24 * 60; // 1440 minutes = 24 hours
 export const EVIDENCE_RETENTION_DAYS = 14;
-export const MAX_WORKER_SLOTS = 4;
-export const MAX_CONCURRENT_SLOTS = 4;
+export { DEFAULT_MAX_WORKERS as MAX_WORKER_SLOTS, DEFAULT_MAX_WORKERS as MAX_CONCURRENT_SLOTS } from "./system-capacity.mjs";
+
 
 // ============================================================================
 // Parser & Payload Size Limits

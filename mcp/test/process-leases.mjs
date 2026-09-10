@@ -34,7 +34,7 @@ import {
   SlotLeaseManager,
 } from "../../skills/delegate-to-antigravity/scripts/lib/leases.mjs";
 
-describe("Windows Process Supervision and Max-Four Slot Leasing", () => {
+describe("Cross-platform Process Supervision and Slot Leasing", () => {
   let tmpRoot;
 
   beforeEach(async () => {
@@ -529,14 +529,18 @@ describe("Windows Process Supervision and Max-Four Slot Leasing", () => {
     it("spawns a detached process without shell command interpolation", async () => {
       const spawned = await spawnDetachedWorker({
         command: process.execPath,
-        args: ["-e", "process.exit(0)"],
+        args: ["-e", "setInterval(() => {}, 1000)"],
         windowsHide: true,
       });
 
-      assert.ok(spawned.pid > 0, "Spawned process must have valid PID");
-      assert.equal(spawned.identity.pid, spawned.pid);
-      assert.equal(spawned.identity.executable, process.execPath);
-      assert.ok(spawned.identity.creationTime);
+      try {
+        assert.ok(spawned.pid > 0, "Spawned process must have valid PID");
+        assert.equal(spawned.identity.pid, spawned.pid);
+        assert.equal(compareExecutables(spawned.identity.executable, process.execPath), true);
+        assert.ok(spawned.identity.creationTime);
+      } finally {
+        spawned.child.kill("SIGKILL");
+      }
     });
   });
 

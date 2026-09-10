@@ -28,32 +28,45 @@ export async function ensureDir(dirPath) {
 // Cross-process lock with an ownership nonce. A live owner is never stolen;
 // callers wait until it releases (or an owner that is provably dead is stale).
 export async function withFileLock(lockPath, fn, options = {}) {
-  const { retryDelayMs = 10, maxWaitMs = 30000, staleMs = 120000 } = options;
-  const owner = `${process.pid}:${generateUuid()}`;
+  const { retryDelayMs = 10, maxWaitMs = 30000 } = options;
+  const nonce = generateUuid();
+  const owner = `${process.pid}:${nonce}`;
+  const ownerFile = path.join(lockPath, `owner-${nonce}.json`);
   const started = Date.now();
   let acquired = false;
   while (!acquired) {
     try {
       await fsp.mkdir(lockPath);
-      await fsp.writeFile(path.join(lockPath, 'owner.json'), JSON.stringify({ owner, pid: process.pid, createdAt: Date.now() }));
+      try {
+        await fsp.writeFile(ownerFile, JSON.stringify({ owner, pid: process.pid, createdAt: Date.now() }), { flag: 'wx' });
+      } catch (err) {
+        await fsp.unlink(ownerFile).catch(() => {});
+        await fsp.rmdir(lockPath).catch(() => {});
+        throw err;
+      }
       acquired = true;
     } catch (err) {
-      if (err.code !== 'EEXIST') throw err;
-      let removable = false;
+      if (err.code !== 'EEXIST' && err.code !== 'ENOENT') throw err;
       try {
-        const info = JSON.parse(await fsp.readFile(path.join(lockPath, 'owner.json'), 'utf8'));
-        if (info.owner && info.pid) {
-          try { process.kill(info.pid, 0); } catch (probe) { removable = probe.code === 'ESRCH'; }
-        } else {
-          removable = Date.now() - (info.createdAt || 0) > staleMs;
+        const entries = await fsp.readdir(lockPath);
+        // Read old owner.json records too, but never recursively remove the
+        // directory: a concurrent reclaimer may already have replaced it.
+        const owners = entries.filter(name => name === 'owner.json' || /^owner-[a-f0-9-]+\.json$/.test(name));
+        if (owners.length === 1) {
+          const observedFile = path.join(lockPath, owners[0]);
+          const info = JSON.parse(await fsp.readFile(observedFile, 'utf8'));
+          let dead = false;
+          if (info.owner && Number.isSafeInteger(info.pid) && info.pid > 0) {
+            try { process.kill(info.pid, 0); } catch (probe) { dead = probe.code === 'ESRCH'; }
+          }
+          if (dead) {
+            // The unique filename prevents a late reclaimer from unlinking a
+            // replacement owner's record. rmdir refuses nonempty directories.
+            await fsp.unlink(observedFile).catch(() => {});
+            await fsp.rmdir(lockPath).catch(() => {});
+          }
         }
-      } catch {
-        removable = false; // never steal an unverified owner
-      }
-      if (removable) {
-        try { await fsp.rm(lockPath, { recursive: true, force: false }); } catch { /* contender owns it */ }
-        continue;
-      }
+      } catch { /* Unknown or incomplete ownership is never stolen by age. */ }
       if (Date.now() - started >= maxWaitMs) throw new Error(`Timed out acquiring lock ${lockPath}`);
       await new Promise(resolve => setTimeout(resolve, retryDelayMs));
     }
@@ -61,9 +74,12 @@ export async function withFileLock(lockPath, fn, options = {}) {
   try { return await fn(); }
   finally {
     try {
-      const info = JSON.parse(await fsp.readFile(path.join(lockPath, 'owner.json'), 'utf8'));
-      if (info.owner === owner) await fsp.rm(lockPath, { recursive: true, force: true });
-    } catch { /* preserve lock if ownership cannot be verified */ }
+      const info = JSON.parse(await fsp.readFile(ownerFile, 'utf8'));
+      if (info.owner === owner) {
+        await fsp.unlink(ownerFile);
+        await fsp.rmdir(lockPath);
+      }
+    } catch { /* Preserve lock if ownership cannot be verified. */ }
   }
 }
 
@@ -304,6 +320,7 @@ export function captureBoundedBuffer(input, maxBytes = MAX_STREAM_CAPTURE_BYTES)
 }
 
 export function createBoundedStreamCollector(maxBytes = MAX_STREAM_CAPTURE_BYTES) {
+  if (!Number.isSafeInteger(maxBytes) || maxBytes < 0) throw new TypeError('maxBytes must be a non-negative safe integer');
   const headTarget = Math.floor(maxBytes / 2);
   const tailTarget = maxBytes - headTarget;
   let totalBytes = 0;
@@ -312,6 +329,7 @@ export function createBoundedStreamCollector(maxBytes = MAX_STREAM_CAPTURE_BYTES
   let truncated = false;
   let headBuffer = Buffer.alloc(0);
   let tailBuffer = Buffer.alloc(0);
+  let tailPosition = 0;
 
   return {
     write(chunk) {
@@ -324,15 +342,27 @@ export function createBoundedStreamCollector(maxBytes = MAX_STREAM_CAPTURE_BYTES
         chunks.push(buf);
         if (totalBytes > maxBytes) {
           truncated = true;
-          const combined = Buffer.concat(chunks);
-          headBuffer = combined.subarray(0, headTarget);
-          tailBuffer = combined.subarray(combined.length - tailTarget);
+          // Copy only retained bytes, even if a single input chunk is huge.
+          headBuffer = Buffer.concat(chunks, headTarget);
+          if (buf.length >= tailTarget) {
+            tailBuffer = Buffer.from(buf.subarray(buf.length - tailTarget));
+          } else {
+            const combined = Buffer.concat(chunks);
+            tailBuffer = Buffer.from(combined.subarray(combined.length - tailTarget));
+          }
           chunks = null;
         }
       } else {
-        tailBuffer = Buffer.concat([tailBuffer, buf]);
-        if (tailBuffer.length > tailTarget) {
-          tailBuffer = tailBuffer.subarray(tailBuffer.length - tailTarget);
+        // Fixed-size circular tail: each incoming byte is copied at most once.
+        if (tailTarget === 0) return;
+        if (buf.length >= tailTarget) {
+          buf.copy(tailBuffer, 0, buf.length - tailTarget);
+          tailPosition = 0;
+        } else {
+          const first = Math.min(buf.length, tailTarget - tailPosition);
+          buf.copy(tailBuffer, tailPosition, 0, first);
+          buf.copy(tailBuffer, 0, first);
+          tailPosition = (tailPosition + buf.length) % tailTarget;
         }
       }
     },
@@ -355,6 +385,9 @@ export function createBoundedStreamCollector(maxBytes = MAX_STREAM_CAPTURE_BYTES
         };
       }
 
+      if (tailPosition) {
+        tailBuffer = Buffer.concat([tailBuffer.subarray(tailPosition), tailBuffer.subarray(0, tailPosition)]);
+      }
       const droppedBytes = totalBytes - (headBuffer.length + tailBuffer.length);
       const headContent = headBuffer.toString('utf8');
       const tailContent = tailBuffer.toString('utf8');

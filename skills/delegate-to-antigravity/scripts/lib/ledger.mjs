@@ -516,6 +516,15 @@ export async function sealAttempt(root, jobId, attemptId, patch = {}, options = 
   return nextState;
 }
 
+function validateRetentionOptions(now, retentionMs) {
+  if (!Number.isFinite(now) || !Number.isFinite(new Date(now).getTime())) {
+    throw new TypeError('now must be a finite epoch timestamp in milliseconds');
+  }
+  if (!Number.isFinite(retentionMs) || retentionMs < 0) {
+    throw new TypeError('retentionMs must be a finite non-negative number');
+  }
+}
+
 export function evaluateJobRetention(job, options = {}) {
   const {
     now = Date.now(),
@@ -523,6 +532,7 @@ export function evaluateJobRetention(job, options = {}) {
     hasPendingOutboxRecord = false,
   } = options;
 
+  validateRetentionOptions(now, retentionMs);
   const reasons = [];
 
   const isTerminalLifecycle = TERMINAL_STATES.lifecycle.has(job.state?.lifecycle);
@@ -543,9 +553,13 @@ export function evaluateJobRetention(job, options = {}) {
     reasons.push('corrupt');
   }
 
-  const updatedAtMs = Date.parse(job.state?.updatedAt || job.manifest?.createdAt || 0);
-  const ageMs = now - updatedAtMs;
-  if (ageMs < retentionMs) {
+  // Only fall back for absent timestamps, never for malformed values. Unknown
+  // age must preserve evidence rather than silently bypass the retention window.
+  const timestamp = job.state?.updatedAt ?? job.manifest?.createdAt;
+  const updatedAtMs = typeof timestamp === 'string' ? Date.parse(timestamp) : NaN;
+  if (!Number.isFinite(updatedAtMs)) {
+    reasons.push('invalid_timestamp');
+  } else if (now - updatedAtMs < retentionMs) {
     reasons.push('within_retention_window');
   }
 
@@ -559,6 +573,8 @@ export async function collectEligibleJobs(root, options = {}) {
     retentionMs = 24 * 3600 * 1000,
     dryRun = false,
   } = options;
+
+  validateRetentionOptions(now, retentionMs);
 
   const resolvedRoot = resolveAgyRoot(root);
   const jobsDir = path.join(resolvedRoot, 'jobs');
@@ -658,7 +674,7 @@ export async function checkStorageHealth(root) {
   }
 
   return {
-    healthy: true,
+    healthy: corruptJobs === 0,
     root: resolvedRoot,
     totalJobs,
     activeJobs,
