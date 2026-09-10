@@ -11,6 +11,7 @@ import { createJob, createAttempt } from '../../skills/delegate-to-antigravity/s
 import { runJobAction } from '../../skills/delegate-to-antigravity/scripts/lib/controller.mjs';
 import { acquireCommonDirLock } from '../../skills/delegate-to-antigravity/scripts/lib/git-worktree.mjs';
 import { terminateOwnedProcessTree } from '../../skills/delegate-to-antigravity/scripts/lib/owned-process.mjs';
+import { withFileLock } from '../../skills/delegate-to-antigravity/scripts/lib/storage.mjs';
 
 async function root(t) {
   const directory = await fsp.mkdtemp(path.join(os.tmpdir(), 'agy-reliability-'));
@@ -24,6 +25,25 @@ const supervisor = {
   validateProcessIdentity: () => ({ matches: true }),
 };
 
+test('stale live nonce owners and malformed owner records remain protected', async (t) => {
+  const directory = await root(t);
+  for (const [name, record] of [
+    ['owner-12345678-abcd.json', JSON.stringify({ owner: 'live-main-owner', pid: process.pid })],
+    ['owner.json', '{malformed'],
+  ]) {
+    const lock = path.join(directory, name + '.lock');
+    await fsp.mkdir(lock);
+    const ownerPath = path.join(lock, name);
+    await fsp.writeFile(ownerPath, record);
+    const old = new Date(Date.now() - 180000);
+    await fsp.utimes(lock, old, old);
+    await assert.rejects(withFileLock(lock, () => assert.fail('protected lock stolen'), {
+      maxWaitMs: 30, retryDelayMs: 5, staleMs: 0,
+    }), /Timed out acquiring lock/);
+    assert.equal(await fsp.readFile(ownerPath, 'utf8'), record);
+  }
+});
+
 test('DMTF signed offsets are minutes and preserve comparison tolerance', () => {
   for (const [offset, expected] of [
     ['+330', '2026-09-07T08:47:58.626Z'],
@@ -35,6 +55,34 @@ test('DMTF signed offsets are minutes and preserve comparison tolerance', () => 
     assert.equal(compareProcessDates(dmtf, Date.parse(expected) + 1000), true);
     assert.equal(compareProcessDates(dmtf, Date.parse(expected) + 3000), false);
   }
+});
+
+test('owned Windows cleanup reports command failures and timeouts', async () => {
+  for (const response of [{ exitCode: 1 }, { exitCode: 0, timedOut: true }, { status: null }]) {
+    const result = await terminateOwnedProcessTree({ pid: 123456, platform: 'win32', commandRunner: async () => response });
+    assert.equal(result.stopped, false);
+  }
+  const thrown = await terminateOwnedProcessTree({ pid: 123456, platform: 'win32', commandRunner: async () => { throw new Error('denied'); } });
+  assert.equal(thrown.stopped, false);
+  const success = await terminateOwnedProcessTree({ pid: 123456, platform: 'win32', commandRunner: async () => ({ exitCode: 0 }) });
+  assert.equal(success.stopped, true);
+});
+
+test('owned cleanup kills a surviving grandchild after its parent exits', {
+  skip: process.platform === 'win32', timeout: 15000,
+}, async (t) => {
+  const script = `const {spawn}=require('node:child_process');
+    const c=spawn(process.execPath,['-e',"process.on('SIGTERM',()=>{}); console.log('ready'); setInterval(()=>{},1000)"],{stdio:['ignore','pipe','ignore']});
+    c.stdout.once('data',()=>console.log(c.pid)); setInterval(()=>{},1000);`;
+  const child = spawn(process.execPath, ['-e', script], { detached: true, stdio: ['ignore', 'pipe', 'ignore'] });
+  t.after(() => { try { process.kill(-child.pid, 'SIGKILL'); } catch {} });
+  const [data] = await once(child.stdout, 'data');
+  const grandchild = Number(data.toString().trim());
+  assert.ok(grandchild > 0);
+  const result = await terminateOwnedProcessTree({ child, gracePeriodMs: 150 });
+  assert.equal(result.stopped, true);
+  assert.equal((await queryProcessIdentity(child.pid)).running, false);
+  assert.equal((await queryProcessIdentity(grandchild)).running, false);
 });
 
 test('failed Windows probes never authorize dead-owner reclaim', async () => {

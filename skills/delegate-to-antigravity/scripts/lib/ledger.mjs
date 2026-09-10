@@ -13,6 +13,9 @@ import {
 } from './storage.mjs';
 import { hasPendingOutbox, listOutboxRecords } from './outbox.mjs';
 
+export const DEFAULT_EVIDENCE_RETENTION_MS = 14 * 24 * 60 * 60 * 1000;
+export const DEFAULT_WORKTREE_RETENTION_MS = 24 * 60 * 60 * 1000;
+
 export const LEGAL_TRANSITIONS = {
   lifecycle: {
     created: ['queued', 'running', 'failed', 'cancelled'],
@@ -528,7 +531,7 @@ function validateRetentionOptions(now, retentionMs) {
 export function evaluateJobRetention(job, options = {}) {
   const {
     now = Date.now(),
-    retentionMs = 24 * 3600 * 1000,
+    retentionMs = DEFAULT_EVIDENCE_RETENTION_MS,
     hasPendingOutboxRecord = false,
   } = options;
 
@@ -567,14 +570,23 @@ export function evaluateJobRetention(job, options = {}) {
   return { eligible, reasons };
 }
 
+/**
+ * Explicit evidence maintenance after verified finalization. Worktrees must
+ * be finalized through the controller; collection never infers ownership or
+ * cleanup permission from a retention deadline.
+ */
 export async function collectEligibleJobs(root, options = {}) {
   const {
     now = Date.now(),
-    retentionMs = 24 * 3600 * 1000,
+    retentionMs,
+    evidenceRetentionMs = retentionMs ?? DEFAULT_EVIDENCE_RETENTION_MS,
+    worktreeRetentionMs = DEFAULT_WORKTREE_RETENTION_MS,
     dryRun = false,
   } = options;
 
-  validateRetentionOptions(now, retentionMs);
+  validateRetentionOptions(now, evidenceRetentionMs);
+  validateRetentionOptions(now, worktreeRetentionMs);
+  if (typeof dryRun !== 'boolean') throw new TypeError('dryRun must be a boolean');
 
   const resolvedRoot = resolveAgyRoot(root);
   const jobsDir = path.join(resolvedRoot, 'jobs');
@@ -584,13 +596,28 @@ export async function collectEligibleJobs(root, options = {}) {
     entries = await fsp.readdir(jobsDir, { withFileTypes: true });
   } catch (err) {
     if (err.code === 'ENOENT') {
-      return { collected: [], skipped: [] };
+      return { collected: [], skipped: [], worktrees: [] };
     }
     throw err;
   }
 
+  // Read pending callbacks once per sweep instead of once per job.
+  const pendingJobIds = new Set();
+  let outboxUnavailable = false;
+  try {
+    for (const record of await listOutboxRecords(root, { strict: true })) {
+      if (record.status === 'pending' || record.status === 'in_flight') {
+        pendingJobIds.add(record.jobId);
+      }
+    }
+  } catch {
+    // An unreadable outbox cannot prove callbacks are drained. Fail closed.
+    outboxUnavailable = true;
+  }
+
   const collected = [];
   const skipped = [];
+  const worktrees = [];
 
   for (const entry of entries) {
     if (!entry.isDirectory()) continue;
@@ -610,25 +637,41 @@ export async function collectEligibleJobs(root, options = {}) {
       };
     }
 
-    const pendingOutbox = await hasPendingOutbox(root, jobId);
     const evaluation = evaluateJobRetention(job, {
       now,
-      retentionMs,
-      hasPendingOutboxRecord: pendingOutbox,
+      retentionMs: evidenceRetentionMs,
+      hasPendingOutboxRecord: outboxUnavailable || pendingJobIds.has(jobId),
     });
 
-    if (!evaluation.eligible) {
-      skipped.push({ jobId, reasons: evaluation.reasons });
+    if (evaluation.eligible) {
+      if (dryRun) {
+        collected.push(jobId);
+        continue;
+      }
+      // Serialize against job state updates and re-read callback evidence
+      // immediately before deletion. Failed reads never authorize collection.
+      const deleted = await withFileLock(path.join(jobDir, '.state.lock'), async () => {
+        let fresh;
+        try { fresh = await getJob(root, jobId); } catch { return false; }
+        const recheck = evaluateJobRetention(fresh, {
+          now,
+          retentionMs: evidenceRetentionMs,
+          hasPendingOutboxRecord: outboxUnavailable || await hasPendingOutbox(root, jobId, { strict: true }),
+        });
+        if (!recheck.eligible) return false;
+        await fsp.rm(jobDir, { recursive: true, force: true });
+        return true;
+      });
+      if (deleted) collected.push(jobId);
+      else skipped.push({ jobId, reasons: ['changed_during_sweep'] });
       continue;
     }
 
-    if (!dryRun) {
-      await fsp.rm(jobDir, { recursive: true, force: true });
-    }
-    collected.push(jobId);
+    skipped.push({ jobId, reasons: evaluation.reasons });
+
   }
 
-  return { collected, skipped };
+  return { collected, skipped, worktrees };
 }
 
 export async function checkStorageHealth(root) {

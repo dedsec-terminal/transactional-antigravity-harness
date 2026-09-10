@@ -1,5 +1,6 @@
 import { describe, it, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
 import fsp from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -18,6 +19,9 @@ import {
   WindowsProcessSupervisor,
 } from "../../skills/delegate-to-antigravity/scripts/lib/windows-process.mjs";
 
+import { withFileLock } from "../../skills/delegate-to-antigravity/scripts/lib/storage.mjs";
+import { terminateOwnedProcessTree } from "../../skills/delegate-to-antigravity/scripts/lib/owned-process.mjs";
+
 import {
   DEFAULT_MAX_SLOTS,
   acquireSlot,
@@ -31,6 +35,7 @@ import {
   getAvailableCount,
   getCounts,
   detectOrphanProcesses,
+  getSlotsDir,
   SlotLeaseManager,
 } from "../../skills/delegate-to-antigravity/scripts/lib/leases.mjs";
 
@@ -696,6 +701,148 @@ describe("Cross-platform Process Supervision and Slot Leasing", () => {
       });
       assert.equal(doubleActivate.activated, false);
       assert.equal(doubleActivate.reason, "phase_not_reserved");
+    });
+  });
+
+  describe("9. Lock recovery and owned process-tree termination", () => {
+    async function deadPid() {
+      const child = spawn(process.execPath, ["-e", ""], { stdio: "ignore" });
+      const pid = child.pid;
+      await new Promise((resolve) => child.once("exit", resolve));
+      return pid;
+    }
+
+    async function waitForExit(pid, timeoutMs = 3000) {
+      const deadline = Date.now() + timeoutMs;
+      while (Date.now() < deadline) {
+        if (!(await queryProcessIdentity(pid)).running) return true;
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      }
+      return false;
+    }
+
+    it("preserves a lock directory whose owner record was never published", async () => {
+      const lockPath = path.join(tmpRoot, "locks", "unpublished.lock");
+      await fsp.mkdir(lockPath, { recursive: true });
+
+      let ran = false;
+      await assert.rejects(withFileLock(lockPath, async () => { ran = true; }, { staleMs: 0, maxWaitMs: 50 }), /Timed out acquiring lock/);
+      assert.equal(ran, false);
+      await fsp.access(lockPath);
+    });
+
+    it("recovers a dead-owner lock but never steals a live owner", async () => {
+      const dead = await deadPid();
+      const deadLock = path.join(tmpRoot, "locks", "dead.lock");
+      await fsp.mkdir(deadLock, { recursive: true });
+      await fsp.writeFile(
+        path.join(deadLock, "owner.json"),
+        JSON.stringify({ owner: `${dead}:dead`, pid: dead, createdAt: Date.now() }),
+      );
+
+      let deadRan = false;
+      await withFileLock(deadLock, async () => { deadRan = true; }, { maxWaitMs: 2000 });
+      assert.equal(deadRan, true);
+
+      const liveLock = path.join(tmpRoot, "locks", "live.lock");
+      await fsp.mkdir(liveLock, { recursive: true });
+      await fsp.writeFile(
+        path.join(liveLock, "owner.json"),
+        JSON.stringify({ owner: `${process.pid}:live`, pid: process.pid, createdAt: Date.now() }),
+      );
+
+      let liveRan = false;
+      await assert.rejects(
+        withFileLock(liveLock, async () => { liveRan = true; }, { maxWaitMs: 50, staleMs: 0 }),
+        /Timed out acquiring lock/,
+      );
+      assert.equal(liveRan, false);
+      await fsp.access(path.join(liveLock, "owner.json"));
+    });
+
+    it("serializes concurrent reclaimers so only one critical section runs at a time", async () => {
+      const dead = await deadPid();
+      const lockPath = path.join(tmpRoot, "locks", "contended.lock");
+      await fsp.mkdir(lockPath, { recursive: true });
+      await fsp.writeFile(
+        path.join(lockPath, "owner.json"),
+        JSON.stringify({ owner: `${dead}:dead`, pid: dead, createdAt: Date.now() }),
+      );
+
+      let inSection = 0;
+      let maxInSection = 0;
+      const work = () => withFileLock(lockPath, async () => {
+        inSection += 1;
+        maxInSection = Math.max(maxInSection, inSection);
+        await new Promise((resolve) => setTimeout(resolve, 40));
+        inSection -= 1;
+      }, { maxWaitMs: 10000 });
+
+      await Promise.all([work(), work(), work()]);
+      assert.equal(maxInSection, 1);
+      await assert.rejects(fsp.stat(lockPath), { code: "ENOENT" });
+    });
+
+    it("acquires a slot whose guard lock holder crashed", async () => {
+      const stateRoot = path.join(tmpRoot, "state");
+      const dead = await deadPid();
+      const crashedGuard = `${path.join(getSlotsDir(stateRoot), "slot-0.json")}.lock`;
+      await fsp.mkdir(crashedGuard, { recursive: true });
+      await fsp.writeFile(
+        path.join(crashedGuard, "owner.json"),
+        JSON.stringify({ owner: `${dead}:dead`, pid: dead, createdAt: Date.now() }),
+      );
+
+      const lease = await acquireSlot({
+        stateRoot,
+        jobId: "job-lock",
+        attemptId: "att-lock",
+        processIdentity: {
+          pid: process.pid,
+          creationTime: new Date().toISOString(),
+          executable: process.execPath,
+          commandLine: "node test",
+        },
+        maxSlots: 1,
+      });
+      assert.equal(lease.acquired, true);
+      const released = await releaseSlot({ stateRoot, slotId: lease.slotId, jobId: "job-lock", attemptId: "att-lock" });
+      assert.equal(released.released, true);
+    });
+
+    it("terminates an owned process tree that ignores SIGTERM", async (t) => {
+      if (process.platform === "win32") {
+        t.skip("POSIX process-group termination test");
+        return;
+      }
+      const script = path.join(tmpRoot, "tree.mjs");
+      await fsp.writeFile(script, [
+        'import { spawn } from "node:child_process";',
+        'process.on("SIGTERM", () => {});',
+        "const grandchild = spawn(process.execPath, [\"-e\", \"process.on('SIGTERM',()=>{});setInterval(()=>{},1000)\"], { stdio: \"ignore\" });",
+        'process.stdout.write(JSON.stringify({ pid: process.pid, grandchild: grandchild.pid }) + "\\n");',
+        'setInterval(() => {}, 1000);',
+      ].join("\n"), "utf8");
+
+      const child = spawn(process.execPath, [script], { detached: true, stdio: ["ignore", "pipe", "ignore"] });
+      try {
+        const announcement = await new Promise((resolve, reject) => {
+          let data = "";
+          child.stdout.on("data", (chunk) => {
+            data += chunk;
+            if (data.includes("\n")) resolve(data.split("\n")[0]);
+          });
+          child.once("error", reject);
+        });
+        const { grandchild } = JSON.parse(announcement);
+
+        const result = await terminateOwnedProcessTree({ child, gracePeriodMs: 500, pollIntervalMs: 50 });
+        assert.equal(result.stopped, true);
+        assert.equal(await waitForExit(child.pid), true, "owned child must exit");
+        assert.equal(await waitForExit(grandchild), true, "grandchild must exit");
+      } finally {
+        try { process.kill(-child.pid, "SIGKILL"); } catch { try { child.kill("SIGKILL"); } catch {} }
+      }
     });
   });
 });

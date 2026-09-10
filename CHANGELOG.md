@@ -7,7 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Add explicit, dry-run-first evidence retention maintenance through `agy_job collect`.
+- Record verified finalize intent so interrupted worktree cleanup can be retried safely.
+- Extend CI coverage to Node 20 and 24 on Windows, Linux, and macOS.
+
 ### Fixed
+- Bound owned-process teardown with POSIX group escalation and report Windows termination failures.
+- Reject AGY 1.1.28+ zero-exit timeout warnings and fatal CLI diagnostics as incomplete execution.
 - Replace fabricated POSIX identities with Linux boot-scoped kernel start tokens and macOS process start/executable/argv probes; fail closed on query errors.
 - Parse DMTF timezone offsets as signed minutes; use shared POSIX process-group teardown for directly owned children.
 - Publish slot leases atomically, recover provably dead directory-lock owners, and report legacy locks/corrupt leases as blocked capacity.

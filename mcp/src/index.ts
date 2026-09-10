@@ -71,6 +71,7 @@ async function runnerAvailable(): Promise<boolean> {
 }
 
 
+
 function runProcess(command: string, args: string[], cwd: string, timeoutMs: number): Promise<RunResult> {
   return new Promise((resolve, reject) => {
     const child = spawn(command, args, {
@@ -80,19 +81,30 @@ function runProcess(command: string, args: string[], cwd: string, timeoutMs: num
       detached: process.platform !== 'win32',
       stdio: ['ignore', 'pipe', 'pipe'],
     });
-    const stdout: Buffer<ArrayBufferLike>[] = [];
-    const stderr: Buffer<ArrayBufferLike>[] = [];
+    const stdoutChunks: Buffer[] = [];
+    const stderrChunks: Buffer[] = [];
     let stdoutBytes = 0;
     let stderrBytes = 0;
     let truncated = false;
     let timedOut = false;
     let settled = false;
 
-    const append = (chunks: Buffer<ArrayBufferLike>[], length: number, chunk: Buffer<ArrayBufferLike>): number => {
-      const kept = Math.min(chunk.length, MAX_OUTPUT_BYTES - length);
-      if (kept < chunk.length) truncated = true;
-      if (kept > 0) chunks.push(Buffer.from(chunk.subarray(0, kept)));
-      return length + kept;
+    // Chunks are queued and concatenated once at close; previously every
+    // chunk copied the whole captured prefix.
+    const append = (
+      chunks: Buffer[],
+      chunk: Buffer,
+      captured: number,
+    ): number => {
+      if (captured >= MAX_OUTPUT_BYTES) {
+        truncated = true;
+        return captured;
+      }
+      const remaining = MAX_OUTPUT_BYTES - captured;
+      const piece = chunk.length > remaining ? chunk.subarray(0, remaining) : chunk;
+      if (chunk.length > remaining) truncated = true;
+      chunks.push(Buffer.from(piece));
+      return captured + piece.length;
     };
 
     let timer: NodeJS.Timeout;
@@ -103,19 +115,31 @@ function runProcess(command: string, args: string[], cwd: string, timeoutMs: num
       callback();
     };
 
-    child.stdout.on('data', (chunk: Buffer<ArrayBufferLike>) => { stdoutBytes = append(stdout, stdoutBytes, chunk); });
-    child.stderr.on('data', (chunk: Buffer<ArrayBufferLike>) => { stderrBytes = append(stderr, stderrBytes, chunk); });
+    child.stdout.on('data', (chunk: Buffer) => { stdoutBytes = append(stdoutChunks, chunk, stdoutBytes); });
+    child.stderr.on('data', (chunk: Buffer) => { stderrBytes = append(stderrChunks, chunk, stderrBytes); });
     child.on('error', (error) => finish(() => reject(error)));
 
     timer = setTimeout(() => {
       timedOut = true;
-      terminateProcessTree(child);
+      void terminateProcessTree(child).then(() => finish(() => {
+        child.stdout.destroy(); child.stderr.destroy(); child.unref();
+        resolve({
+        exitCode: null,
+        stdout: Buffer.concat(stdoutChunks).toString('utf8'),
+        stderr: Buffer.concat(stderrChunks).toString('utf8'),
+        timedOut: true,
+        truncated,
+        });
+      })).catch(() => finish(() => {
+        child.stdout.destroy(); child.stderr.destroy(); child.unref();
+        resolve({ exitCode: null, stdout: '', stderr: 'Process cleanup failed', timedOut: true, truncated });
+      }));
     }, timeoutMs);
 
     child.on('close', (exitCode) => finish(() => resolve({
       exitCode,
-      stdout: Buffer.concat(stdout, stdoutBytes).toString('utf8'),
-      stderr: Buffer.concat(stderr, stderrBytes).toString('utf8'),
+      stdout: Buffer.concat(stdoutChunks).toString('utf8'),
+      stderr: Buffer.concat(stderrChunks).toString('utf8'),
       timedOut,
       truncated,
     })));
@@ -386,17 +410,17 @@ function createServer(): McpServer {
   );
 
   server.registerTool('agy_job', {
-    title: 'Manage Antigravity Job',
-    description: 'Inspect or transition a transactional Antigravity job, or view bounded safe lifecycle events via args.limit (default50).',
+      title: 'Manage Antigravity Job',
+      description: 'Inspect or transition a transactional Antigravity job, or view bounded safe lifecycle events via args.limit (default50). The collect action performs retention maintenance and is dry-run unless args.dryRun is false.',
     inputSchema: z.object({
-      action: z.enum(['status', 'list', 'cancel', 'reconcile', 'apply', 'finalize', 'activity']),
+      action: z.enum(['status', 'list', 'cancel', 'reconcile', 'apply', 'finalize', 'activity', 'collect']),
       jobId: z.string().min(1).max(200).optional(),
       args: z.record(z.string(), z.unknown()).optional(),
     }),
     annotations: { readOnlyHint: false, openWorldHint: false, destructiveHint: true, idempotentHint: false },
   }, async ({ action, jobId, args: jobArgs }) => {
     if (!(await runnerAvailable())) return failure(`Antigravity runner was not found at: ${runnerPath()}`);
-    if (!['list', 'reconcile'].includes(action) && !jobId) return failure(`jobId is required for ${action}`);
+    if (!['list', 'reconcile', 'collect'].includes(action) && !jobId) return failure(`jobId is required for ${action}`);
     try {
       const payload = JSON.stringify({ ...(jobArgs ?? {}), ...(jobId ? { jobId } : {}) });
       const result = await runProcess(process.execPath, [runnerPath(), '--job-action', action, '--job-args-json', payload], pluginRoot(), 30_000);

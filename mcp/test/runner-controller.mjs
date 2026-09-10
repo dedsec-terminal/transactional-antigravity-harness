@@ -18,10 +18,47 @@ import {
   runJobAction,
 } from "../../skills/delegate-to-antigravity/scripts/lib/controller.mjs";
 import { readActivityEvents } from "../../skills/delegate-to-antigravity/scripts/lib/activity.mjs";
-import { runGit } from "../../skills/delegate-to-antigravity/scripts/lib/git-worktree.mjs";
+import { runGit, finalizeWorktree, verifyWorktreeOwnership } from "../../skills/delegate-to-antigravity/scripts/lib/git-worktree.mjs";
+import { collectEligibleJobs } from "../../skills/delegate-to-antigravity/scripts/lib/ledger.mjs";
+import { createJob, updateJobState } from "../../skills/delegate-to-antigravity/scripts/lib/ledger.mjs";
 import { getActiveCount } from "../../skills/delegate-to-antigravity/scripts/lib/leases.mjs";
 
 async function tempRoot(prefix) { return fsp.mkdtemp(path.join(os.tmpdir(), prefix)); }
+
+test('CLI timeout warnings and fatal stderr cannot become successful attempts', async () => {
+  const root = await tempRoot('agy-cli-outcome-');
+  try {
+    for (const [stderr, expected] of [
+      ['Warning: --print-timeout expired; returning partial output.', 'timed_out'],
+      ['error: model request failed', 'failed'],
+    ]) {
+      const prepared = await persistBeforeSpawn({ root, params: { cwd: root, mode: 'plan', prompt: 'fixture' } });
+      const result = await completeRun(root, prepared.job.jobId, prepared.attempt.attemptId, {
+        exitCode: 0, stdout: terminal({ status: 'success', summary: 'partial', verification: 'unverified', claimedChangedPaths: [] }),
+        stderr, timedOut: false, truncated: false,
+      });
+      assert.equal(result.execution, expected);
+    }
+  } finally { await fsp.rm(root, { recursive: true, force: true }); }
+});
+
+test('collect preserves expired evidence when callback records are corrupt', async () => {
+  const root = await tempRoot('agy-corrupt-outbox-');
+  try {
+    const old = Date.now() - 20 * 86400000;
+    const job = await createJob(root, {}, { now: old });
+    await updateJobState(root, job.jobId, { lifecycle: 'running' }, { now: old });
+    await updateJobState(root, job.jobId, { lifecycle: 'completed' }, { now: old });
+    await fsp.mkdir(path.join(root, 'outbox'));
+    await fsp.writeFile(path.join(root, 'outbox', 'unknown.json'), '{malformed');
+    const result = await runJobAction(root, 'collect', undefined, { dryRun: false });
+    assert.deepEqual(result.collected, []);
+    await fsp.access(path.join(root, 'jobs', job.jobId, 'state.json'));
+    for (const options of [{ evidenceRetentionMs: false }, { retentionMs: '0' }, { dryRun: 'false' }]) {
+      await assert.rejects(runJobAction(root, 'collect', undefined, options));
+    }
+  } finally { await fsp.rm(root, { recursive: true, force: true }); }
+});
 
 async function initRepo() {
   const repo = await tempRoot("agy-controller-repo-");
@@ -61,6 +98,19 @@ test("safe defaults, retention bounds, and exact async public response", () => {
   const output = exactAsyncResponse("thread-1", { jobId: "job-1", attempt: 1 });
   assert.deepEqual(JSON.parse(output.split(/\r?\n/)[0]), { status: "dispatched_async", thread: "thread-1" });
   assert.match(output.split(/\r?\n/)[1], /^AGY_META /);
+});
+
+test("retention collection validates defaults and malformed options", async () => {
+  const root = await tempRoot("agy-retention-options-");
+  try {
+    const preview = await collectEligibleJobs(root, { dryRun: true });
+    assert.deepEqual(preview, { collected: [], skipped: [], worktrees: [] });
+    await assert.rejects(collectEligibleJobs(root, { evidenceRetentionMs: Number.NaN }), /finite/);
+    await assert.rejects(collectEligibleJobs(root, { worktreeRetentionMs: -1 }), /non-negative/);
+    await assert.rejects(collectEligibleJobs(root, { dryRun: "false" }), /boolean/);
+  } finally {
+    await fsp.rm(root, { recursive: true, force: true });
+  }
 });
 
 test("shared plan persists before execution and seals immutable typed result", async () => {
@@ -513,6 +563,91 @@ test("subagents metadata persistence, resume match enforcement, and callback lin
   } finally {
     await fsp.rm(root, { recursive: true, force: true });
     await fsp.rm(repo, { recursive: true, force: true });
+  }
+});
+
+test("finalize survives a crash between worktree removal and the finalized state write", async () => {
+  const root = await tempRoot("agy-controller-state-");
+  const repo = await initRepo();
+  try {
+    const prepared = await persistBeforeSpawn({ root, params: { cwd: repo, mode: "accept-edits", targets: ["owned.txt"], prompt: "edit owned" } });
+    await fsp.writeFile(path.join(prepared.executionCwd, "owned.txt"), "after crash\n");
+    const completed = await completeRun(root, prepared.job.jobId, prepared.attempt.attemptId, {
+      exitCode: 0,
+      stdout: terminal({ status: "success", summary: "edited", verification: "checked", diagnostics: [], claimedChangedPaths: ["owned.txt"] }),
+      stderr: "",
+      timedOut: false,
+      truncated: false,
+    });
+    assert.equal(completed.artifactState, "verified");
+
+    // Simulate the crash: cleanup intent persisted, worktree removed, but the
+    // finalized state write never happened.
+    const verified = await verifyWorktreeOwnership(prepared.executionCwd, { repoRoot: repo });
+    await updateJobState(root, prepared.job.jobId, {
+      finalizeIntent: { worktreePath: verified.canonicalPath, marker: verified.marker, requestedAt: new Date().toISOString() },
+    });
+    const removed = await finalizeWorktree(prepared.executionCwd, { repoRoot: repo });
+    assert.equal(removed.status, "removed");
+
+    const retried = await runJobAction(root, "finalize", prepared.job.jobId);
+    assert.equal(retried.finalized, true);
+    assert.equal(retried.cleanup.reconciled, true);
+    const status = await runJobAction(root, "status", prepared.job.jobId);
+    assert.equal(status.state.finalized, true);
+    assert.equal(status.state.finalizeIntent, null);
+  } finally {
+    await fsp.rm(root, { recursive: true, force: true });
+    await fsp.rm(repo, { recursive: true, force: true });
+  }
+});
+
+test("finalize refuses a missing worktree that was never finalized", async () => {
+  const root = await tempRoot("agy-controller-state-");
+  const repo = await initRepo();
+  try {
+    const prepared = await persistBeforeSpawn({ root, params: { cwd: repo, mode: "accept-edits", targets: ["owned.txt"], prompt: "edit owned" } });
+    await fsp.writeFile(path.join(prepared.executionCwd, "owned.txt"), "after\n");
+    await completeRun(root, prepared.job.jobId, prepared.attempt.attemptId, {
+      exitCode: 0,
+      stdout: terminal({ status: "success", summary: "edited", verification: "checked", diagnostics: [], claimedChangedPaths: ["owned.txt"] }),
+      stderr: "",
+      timedOut: false,
+      truncated: false,
+    });
+
+    await fsp.rm(prepared.executionCwd, { recursive: true, force: true });
+    await assert.rejects(
+      runJobAction(root, "finalize", prepared.job.jobId),
+      /WORKTREE_NOT_FOUND|not accessible/,
+    );
+    const status = await runJobAction(root, "status", prepared.job.jobId);
+    assert.equal(status.state.finalized, false);
+  } finally {
+    await fsp.rm(root, { recursive: true, force: true });
+    await fsp.rm(repo, { recursive: true, force: true });
+  }
+});
+
+test("collect action is dry-run by default and deletes eligible evidence only when asked", async () => {
+  const root = await tempRoot("agy-controller-state-");
+  try {
+    const old = Date.now() - 20 * 24 * 60 * 60 * 1000;
+    const job = await createJob(root, { prompt: "expired" }, { now: old });
+    await updateJobState(root, job.jobId, { lifecycle: "running" }, { now: old });
+    await updateJobState(root, job.jobId, { lifecycle: "completed" }, { now: old });
+
+    const dryRun = await runJobAction(root, "collect");
+    assert.equal(dryRun.dryRun, true);
+    assert.ok(dryRun.collected.includes(job.jobId));
+    await fsp.access(path.join(root, "jobs", job.jobId));
+
+    const applied = await runJobAction(root, "collect", undefined, { dryRun: false });
+    assert.equal(applied.dryRun, false);
+    assert.ok(applied.collected.includes(job.jobId));
+    await assert.rejects(fsp.access(path.join(root, "jobs", job.jobId)), { code: "ENOENT" });
+  } finally {
+    await fsp.rm(root, { recursive: true, force: true });
   }
 });
 

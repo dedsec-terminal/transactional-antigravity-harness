@@ -76,6 +76,17 @@ try {
     assert.equal(list.structuredContent.jobs.length, 1);
     const cancel = await client.callTool({ name: 'agy_job', arguments: { action: 'cancel', jobId: job.jobId } });
     assert.equal(cancel.structuredContent.reason, 'no_active_worker');
+    const collect = await client.callTool({ name: 'agy_job', arguments: { action: 'collect' } });
+    assert.notEqual(collect.isError, true);
+    assert.equal(collect.structuredContent.action, 'collect');
+    assert.equal(collect.structuredContent.dryRun, true);
+    assert.deepEqual(collect.structuredContent.collected, []);
+    assert.ok(collect.structuredContent.skipped.some(item => item.jobId === job.jobId));
+    await fsp.access(path.join(protocolStateRoot, 'jobs', job.jobId, 'state.json'));
+    const invalidCollect = await client.callTool({ name: 'agy_job', arguments: {
+      action: 'collect', args: { evidenceRetentionMs: -1 },
+    } });
+    assert.equal(invalidCollect.isError, true);
   }
 
   if (!protocolOnly) {

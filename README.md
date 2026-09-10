@@ -118,9 +118,9 @@ flowchart TD
 4. **Path Traversal Protection**: Target paths are constrained to the workspace root; directory traversal (`..`) attempts outside the workspace are rejected.
 5. **Retention and Cleanup**:
 
-   * **Worktrees**: Use explicit `agy_job finalize` after verification to remove a job's worktree. The `retentionMinutes` field (default 1,440) is reserved policy metadata, **not an automatic expiry timer**.
-   * **Evidence Ledger**: Automatic ledger/outbox pruning is not currently wired into the runner or `reconcile`. The 14-day evidence constant is a policy target, not an enforced deletion schedule. Monitor disk usage and retain evidence needed for pending callbacks and review.
-   * **Fail-safe Cleanup Library**: `collectEligibleJobs` is an explicit library operation (24-hour default window). It preserves active, unfinalized, callback-pending and corrupt jobs, and jobs with missing or malformed retention timestamps (`invalid_timestamp`). It rejects invalid clocks and negative/non-finite retention windows before scanning.
+   * **Worktrees**: Removed only by explicit `agy_job finalize`, including retries after busy-file failures. The 24-hour worktree retention setting is policy metadata, not a deletion timer; `collect` never removes worktrees.
+   * **Evidence Ledger**: `agy_job` with `action: "collect"` previews finalized evidence older than 14 days. Pass `args: { "dryRun": false }` to delete eligible evidence. This is explicit maintenance, not a scheduled background sweep.
+   * **Fail-safe Cleanup Library**: `collectEligibleJobs` uses a 14-day evidence window. It preserves active, unfinalized, callback-pending and corrupt jobs, and jobs with missing or malformed retention timestamps (`invalid_timestamp`). Invalid clocks and negative/non-finite retention windows are rejected; unreadable callback records block collection.
    * **Blocked Leases**: New owner-bearing slot locks recover when their owner is provably dead. Legacy nonce-only locks and corrupt leases are reported as blocked capacity and preserved. Verify no worker is still using the slot before manual repair; malformed data is not proof that a worker has stopped.
 
 ---
@@ -132,6 +132,8 @@ flowchart TD
 * **Git**: Installed and available on `PATH`
 * **Google Antigravity CLI**: `agy` installed and authenticated on your local machine (`agy.exe` on `PATH` or in `%LOCALAPPDATA%\agy\bin\` on Windows).
 * **OpenAI Codex CLI** *(optional, required for async notifications)*: Installed and available on `PATH` to deliver asynchronous callbacks via `codex queue`.
+
+AGY 1.1.28 and later can return partial output with exit code zero when `--print-timeout` expires. The harness treats CLI timeout warnings as incomplete execution and preserves the artifact for review; a zero exit code alone never authorizes apply. See the [official CLI changelog](https://github.com/google-antigravity/antigravity-cli/blob/main/CHANGELOG.md).
 
 ---
 

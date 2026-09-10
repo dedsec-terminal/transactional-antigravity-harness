@@ -34,6 +34,8 @@ import {
   evaluateJobRetention,
   collectEligibleJobs,
   checkStorageHealth,
+  DEFAULT_EVIDENCE_RETENTION_MS,
+  DEFAULT_WORKTREE_RETENTION_MS,
 } from '../../skills/delegate-to-antigravity/scripts/lib/ledger.mjs';
 
 import {
@@ -437,6 +439,34 @@ describe('Durable Filesystem Foundation: Storage, Ledger, and Outbox', () => {
       assert.equal(result.droppedBytes, (chunk1.length + chunk2.length + chunk3.length) - limit);
       assert.equal(result.sha256, sha256(Buffer.concat([chunk1, chunk2, chunk3])));
     });
+
+    it('matches captureBoundedBuffer for byte-sized and 64 KiB chunks past the cap', () => {
+      const limit = 4096;
+      const payload = Buffer.alloc(limit * 3 + 777);
+      for (let i = 0; i < payload.length; i++) payload[i] = i % 251;
+
+      const byteCollector = createBoundedStreamCollector(limit);
+      for (const byte of payload) byteCollector.write(Buffer.from([byte]));
+      const byteResult = byteCollector.finish();
+      const expected = captureBoundedBuffer(payload, limit);
+      assert.deepEqual({ ...byteResult, sha256: undefined }, { ...expected, sha256: undefined });
+      assert.equal(byteResult.sha256, expected.sha256);
+
+      const chunkSize = 64 * 1024;
+      const largeLimit = MAX_STREAM_CAPTURE_BYTES;
+      const largePayload = Buffer.alloc(largeLimit + chunkSize * 4);
+      for (let offset = 0; offset < largePayload.length; offset += 4096) {
+        largePayload.write('CHUNKPATTERN', offset, 'utf8');
+      }
+      const chunkCollector = createBoundedStreamCollector(largeLimit);
+      for (let offset = 0; offset < largePayload.length; offset += chunkSize) {
+        chunkCollector.write(largePayload.subarray(offset, Math.min(offset + chunkSize, largePayload.length)));
+      }
+      const chunkResult = chunkCollector.finish();
+      const largeExpected = captureBoundedBuffer(largePayload, largeLimit);
+      assert.deepEqual({ ...chunkResult, sha256: undefined }, { ...largeExpected, sha256: undefined });
+      assert.equal(chunkResult.sha256, largeExpected.sha256);
+    });
   });
 
   describe('7. Outbox Keying, Hashing, and Retry Schedule', () => {
@@ -524,7 +554,7 @@ describe('Durable Filesystem Foundation: Storage, Ledger, and Outbox', () => {
     const retentionNow = Date.parse('2026-09-10T12:00:00.000Z');
     const completedJob = (updatedAt) => ({
       state: { lifecycle: 'completed', finalized: true, callback: 'acknowledged', updatedAt },
-      manifest: { createdAt: '2026-09-01T00:00:00.000Z' },
+      manifest: { createdAt: '2026-08-20T00:00:00.000Z' },
     });
 
     it('preserves jobs with malformed or missing age evidence', () => {
@@ -726,6 +756,67 @@ describe('Durable Filesystem Foundation: Storage, Ledger, and Outbox', () => {
       assert.equal(health.activeJobs, 1);
       assert.equal(health.corruptJobs, 1);
       assert.equal(health.pendingOutboxCount, 1);
+    });
+
+    it('defaults to 14-day evidence retention and 24-hour worktree retention constants', async () => {
+      const fourteenDaysMs = 14 * 24 * 60 * 60 * 1000;
+      assert.equal(DEFAULT_EVIDENCE_RETENTION_MS, fourteenDaysMs);
+      assert.equal(DEFAULT_WORKTREE_RETENTION_MS, 24 * 60 * 60 * 1000);
+
+      const job = await createJob(tmpRoot, { prompt: 'defaults' });
+      await updateJobState(tmpRoot, job.jobId, { lifecycle: 'running' });
+      await updateJobState(tmpRoot, job.jobId, { lifecycle: 'completed' });
+      const fetched = await getJob(tmpRoot, job.jobId);
+      const updatedAtMs = Date.parse(fetched.state.updatedAt);
+
+      const within = evaluateJobRetention(fetched, { now: updatedAtMs + fourteenDaysMs - 1000 });
+      assert.equal(within.eligible, false);
+      assert.ok(within.reasons.includes('within_retention_window'));
+
+      const beyond = evaluateJobRetention(fetched, { now: updatedAtMs + fourteenDaysMs + 1000 });
+      assert.equal(beyond.eligible, true);
+    });
+
+    it('dry-run lists expired evidence without deleting and pending outbox blocks real collection', async () => {
+      const old = Date.now() - 20 * 24 * 60 * 60 * 1000;
+
+      const eligibleJob = await createJob(tmpRoot, { prompt: 'expired' }, { now: old });
+      await updateJobState(tmpRoot, eligibleJob.jobId, { lifecycle: 'running' }, { now: old });
+      await updateJobState(tmpRoot, eligibleJob.jobId, { lifecycle: 'completed', callback: 'pending' }, { now: old });
+      await updateJobState(tmpRoot, eligibleJob.jobId, { callback: 'acknowledged' }, { now: old });
+
+      const callbackBlockedJob = await createJob(tmpRoot, { prompt: 'pending callback' }, { now: old });
+      await updateJobState(tmpRoot, callbackBlockedJob.jobId, { lifecycle: 'running' }, { now: old });
+      await updateJobState(tmpRoot, callbackBlockedJob.jobId, { lifecycle: 'completed', callback: 'pending' }, { now: old });
+      await updateJobState(tmpRoot, callbackBlockedJob.jobId, { callback: 'acknowledged' }, { now: old });
+      await enqueueOutboxRecord(tmpRoot, {
+        jobId: callbackBlockedJob.jobId,
+        attemptId: crypto.randomUUID(),
+        payload: { notify: true },
+      });
+
+      const dryRun = await collectEligibleJobs(tmpRoot, { now: Date.now(), dryRun: true });
+      assert.ok(dryRun.collected.includes(eligibleJob.jobId));
+      await fsp.access(path.join(tmpRoot, 'jobs', eligibleJob.jobId));
+
+      const originalReaddir = fsp.readdir;
+      let outboxListings = 0;
+      fsp.readdir = async (...args) => {
+        if (String(args[0]).endsWith('outbox')) outboxListings += 1;
+        return originalReaddir.apply(fsp, args);
+      };
+      let result;
+      try {
+        result = await collectEligibleJobs(tmpRoot, { now: Date.now() });
+      } finally {
+        fsp.readdir = originalReaddir;
+      }
+
+      assert.ok(result.collected.includes(eligibleJob.jobId));
+      assert.ok(!result.collected.includes(callbackBlockedJob.jobId));
+      await assert.rejects(fsp.access(path.join(tmpRoot, 'jobs', eligibleJob.jobId)), { code: 'ENOENT' });
+      await fsp.access(path.join(tmpRoot, 'jobs', callbackBlockedJob.jobId));
+      assert.ok(outboxListings <= 3, `outbox should be listed once per sweep, saw ${outboxListings}`);
     });
   });
 });
