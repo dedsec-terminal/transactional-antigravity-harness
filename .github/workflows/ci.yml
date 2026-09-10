@@ -15,8 +15,12 @@ concurrency:
 
 jobs:
   ci:
-    name: Windows CI
-    runs-on: windows-latest
+    name: CI (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
     defaults:
       run:
         working-directory: mcp
@@ -39,6 +43,9 @@ jobs:
 
       - name: Run build
         run: npm run build
+
+      - name: Check committed bundle matches source
+        run: git diff --exit-code -- dist/server.cjs
 
       - name: Run tests
         run: npm test

@@ -116,10 +116,12 @@ flowchart TD
 2. **Untrusted Worker Principle**: Worker claims are untrusted by default. The parent orchestrator inspects actual git/filesystem diffs and executes automated tests before changes are accepted.
 3. **Explicit Apply & Finalize**: Completed worktree changes are never merged automatically. The parent orchestrator reviews the patch hash, applies verified changes, and cleans up the worktree.
 4. **Path Traversal Protection**: Target paths are constrained to the workspace root; directory traversal (`..`) attempts outside the workspace are rejected.
-5. **Retention Policies**:
+5. **Retention and Cleanup**:
 
-   * **Worktrees**: Retained for 24 hours (1,440 minutes by default) to allow manual inspection and debugging before disposal.
-   * **Evidence Ledger**: Job logs, terminal events, and hashes are kept for 14 days for forensic traceability.
+   * **Worktrees**: Use explicit `agy_job finalize` after verification to remove a job's worktree. The `retentionMinutes` field (default 1,440) is reserved policy metadata, **not an automatic expiry timer**.
+   * **Evidence Ledger**: Automatic ledger/outbox pruning is not currently wired into the runner or `reconcile`. The 14-day evidence constant is a policy target, not an enforced deletion schedule. Monitor disk usage and retain evidence needed for pending callbacks and review.
+   * **Fail-safe Cleanup Library**: `collectEligibleJobs` is an explicit library operation (24-hour default window). It preserves active, unfinalized, callback-pending and corrupt jobs, and jobs with missing or malformed retention timestamps (`invalid_timestamp`). It rejects invalid clocks and negative/non-finite retention windows before scanning.
+   * **Blocked Leases**: New owner-bearing slot locks recover when their owner is provably dead. Legacy nonce-only locks and corrupt leases are reported as blocked capacity and preserved. Verify no worker is still using the slot before manual repair; malformed data is not proof that a worker has stopped.
 
 ---
 
@@ -240,6 +242,9 @@ Synchronously delegates a bounded task to Antigravity and waits for the result.
 * `timeoutSeconds` (number, default `300`): Execution timeout (1–1800s). Sizing target is under 25s.
 * `outputFormat` (`"text"` | `"json"`, default `"text"`): Desired output structure.
 * `resumeJobId` (string, optional): Resume a prior job attempt in its existing worktree.
+* `agent` (string, optional): Antigravity agent identifier, forwarded as `--agent`.
+* `model` (string, optional): Antigravity model identifier, forwarded as `--model`. When omitted, the harness uses the CLI's configured default rather than pinning a model.
+* `retentionMinutes` (integer, optional, 10–10080): Reserved policy metadata; currently does not schedule deletion. Use explicit `agy_job finalize` for worktree cleanup.
 
 ```json
 {
@@ -273,7 +278,7 @@ Dispatches a background worker task and returns an immediate acknowledgement. Wh
 ```
 
 ### `agy_job`
-Inspects or manages the lifecycle of transactional jobs.
+Inspects or manages the lifecycle of transactional jobs. Successful responses include the parsed job-action result in MCP `structuredContent`, including `state` and `attempts[].artifactPaths` for status, or `jobs` for list. The JSON text response is retained for compatibility.
 
 **Parameters**:
 

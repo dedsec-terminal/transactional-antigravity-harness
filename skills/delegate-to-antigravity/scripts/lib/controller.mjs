@@ -492,9 +492,15 @@ export async function runJobAction(root, action, jobId, options = {}) {
   if (action === "reconcile") return reconcileJobs(stateRoot, options);
   if (action === "cancel") {
     const attemptId = job.state.activeAttemptId;
+    if (!attemptId) return { action, jobId, cancelled: false, reason: "no_active_worker" };
     const attempt = await getAttempt(stateRoot, jobId, attemptId);
     if (attempt.state.sealed) return { action, jobId, cancelled: false, reason: "attempt_terminal" };
-    const worker = await readJson(path.join(attempt.attemptDir, "worker.json"));
+    let worker;
+    try { worker = await readJson(path.join(attempt.attemptDir, "worker.json")); }
+    catch (err) {
+      if (err.code === "ENOENT") return { action, jobId, cancelled: false, reason: "no_active_worker" };
+      throw err;
+    }
     const stopped = await terminateProcess({ pid: worker.identity.pid, identity: worker.identity, cancellationMarkerPath: path.join(attempt.attemptDir, "cancel.json") });
     if (!stopped.stopped) return { action, jobId, cancelled: false, stopped };
     await releaseWorker(stateRoot, jobId, attemptId);

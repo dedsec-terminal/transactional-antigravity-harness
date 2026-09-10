@@ -12,17 +12,8 @@ import {
   verifyWorktreeOwnership,
 } from "./git-worktree.mjs";
 
-export function deterministicJsonStringify(obj) {
-  if (obj === null || typeof obj !== "object") {
-    return JSON.stringify(obj);
-  }
-  if (Array.isArray(obj)) {
-    return `[${obj.map((item) => deterministicJsonStringify(item)).join(",")}]`;
-  }
-  const keys = Object.keys(obj).sort();
-  const pairs = keys.map((key) => `${JSON.stringify(key)}:${deterministicJsonStringify(obj[key])}`);
-  return `{${pairs.join(",")}}`;
-}
+import { canonicalJsonStringify as deterministicJsonStringify } from "./storage.mjs";
+export { deterministicJsonStringify };
 
 export function hashManifest(manifest) {
   return crypto.createHash("sha256").update(deterministicJsonStringify(manifest)).digest("hex");

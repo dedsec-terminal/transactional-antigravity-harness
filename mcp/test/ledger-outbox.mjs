@@ -60,6 +60,27 @@ describe('Durable Filesystem Foundation: Storage, Ledger, and Outbox', () => {
     }
   });
 
+  it('circular stream tail matches whole-buffer capture across chunk sizes', () => {
+    const source = Buffer.from('abcdefghijklmnopqrstuvwxyz'.repeat(20));
+    for (const maxBytes of [0, 1, 2, 7, 32, 100, 1000]) {
+      for (const chunkSize of [1, 3, 16, 100, 1000]) {
+        const collector = createBoundedStreamCollector(maxBytes);
+        for (let offset = 0; offset < source.length; offset += chunkSize) {
+          collector.write(source.subarray(offset, offset + chunkSize));
+        }
+        const result = collector.finish();
+        assert.equal(result.totalBytes, source.length);
+        assert.equal(result.sha256, sha256(source));
+        if (source.length <= maxBytes) {
+          assert.equal(result.content, source.toString());
+        } else {
+          assert.equal(result.headContent, source.subarray(0, Math.floor(maxBytes / 2)).toString());
+          assert.equal(result.tailContent, source.subarray(source.length - (maxBytes - Math.floor(maxBytes / 2))).toString());
+        }
+      }
+    }
+  });
+
   describe('1. SHA-256 Helpers', () => {
     it('computes sha256 of strings and buffers matching standard vectors', () => {
       // Empty string sha256
@@ -500,6 +521,61 @@ describe('Durable Filesystem Foundation: Storage, Ledger, and Outbox', () => {
   });
 
   describe('8. Health Checks and Retention / GC Eligibility', () => {
+    const retentionNow = Date.parse('2026-09-10T12:00:00.000Z');
+    const completedJob = (updatedAt) => ({
+      state: { lifecycle: 'completed', finalized: true, callback: 'acknowledged', updatedAt },
+      manifest: { createdAt: '2026-09-01T00:00:00.000Z' },
+    });
+
+    it('preserves jobs with malformed or missing age evidence', () => {
+      for (const timestamp of ['', 'not-a-date', 0, false, {}, []]) {
+        assert.deepEqual(evaluateJobRetention(completedJob(timestamp), { now: retentionNow }), {
+          eligible: false, reasons: ['invalid_timestamp'],
+        });
+      }
+      const missing = completedJob(undefined);
+      delete missing.manifest.createdAt;
+      assert.deepEqual(evaluateJobRetention(missing, { now: retentionNow }), {
+        eligible: false, reasons: ['invalid_timestamp'],
+      });
+    });
+
+    it('supports creation-time fallback and exact retention boundaries', () => {
+      assert.equal(evaluateJobRetention(completedJob(undefined), { now: retentionNow }).eligible, true);
+      for (const [age, eligible] of [[999, false], [1000, true], [1001, true], [-1, false]]) {
+        const job = completedJob(new Date(retentionNow - age).toISOString());
+        assert.equal(evaluateJobRetention(job, { now: retentionNow, retentionMs: 1000 }).eligible, eligible);
+      }
+      assert.equal(evaluateJobRetention(completedJob(new Date(retentionNow + 1).toISOString()), {
+        now: retentionNow, retentionMs: 0,
+      }).eligible, false);
+    });
+
+    it('rejects unsafe cleanup options even on an empty ledger', async () => {
+      for (const options of [
+        { now: NaN }, { now: Infinity }, { now: 1e20 }, { now: '2026-09-10' },
+        { retentionMs: -1 }, { retentionMs: NaN }, { retentionMs: Infinity }, { retentionMs: '0' },
+      ]) {
+        assert.throws(() => evaluateJobRetention(completedJob(undefined), options), TypeError);
+        await assert.rejects(collectEligibleJobs(tmpRoot, options), TypeError);
+      }
+    });
+
+    it('preserves malformed timestamps on disk in both dry-run and destructive cleanup', async () => {
+      const job = await createJob(tmpRoot, {}, { now: retentionNow - 100000 });
+      await updateJobState(tmpRoot, job.jobId, { lifecycle: 'failed' });
+      const statePath = path.join(job.jobDir, 'state.json');
+      const state = await readJson(statePath);
+      state.updatedAt = 'invalid';
+      await writeJsonAtomic(statePath, state);
+      for (const dryRun of [true, false]) {
+        const result = await collectEligibleJobs(tmpRoot, { now: retentionNow, retentionMs: 0, dryRun });
+        assert.deepEqual(result.collected, []);
+        assert.deepEqual(result.skipped, [{ jobId: job.jobId, reasons: ['invalid_timestamp'] }]);
+        assert.deepEqual(await readJson(statePath), state);
+      }
+    });
+
     it('never auto-collects active jobs', async () => {
       const job = await createJob(tmpRoot, { prompt: 'active job' });
       await updateJobState(tmpRoot, job.jobId, { lifecycle: 'running' });
@@ -645,7 +721,7 @@ describe('Durable Filesystem Foundation: Storage, Ledger, and Outbox', () => {
 
       // Check health report
       const health = await checkStorageHealth(tmpRoot);
-      assert.equal(health.healthy, true);
+      assert.equal(health.healthy, false);
       assert.equal(health.totalJobs, 3);
       assert.equal(health.activeJobs, 1);
       assert.equal(health.corruptJobs, 1);

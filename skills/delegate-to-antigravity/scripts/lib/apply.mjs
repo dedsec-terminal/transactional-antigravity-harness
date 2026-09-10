@@ -219,7 +219,10 @@ export async function applyPatch({
 
   // Validate the caller-supplied manifest before using any of its mutable
   // fields (especially baseSha) for subsequent checks.
-  if (manifestHash) {
+  if (typeof manifestHash !== "string" || !/^[a-f0-9]{64}$/.test(manifestHash)) {
+    return { success: false, applied: false, blocked: true, reasons: ["MANIFEST_HASH_REQUIRED"], conflicts: [] };
+  }
+  {
     const computedManifestHash = hashManifest(manifest);
     if (computedManifestHash !== manifestHash) {
       return {

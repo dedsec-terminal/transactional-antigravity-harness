@@ -1,11 +1,13 @@
 #!/usr/bin/env node
 
-import { spawn, spawnSync } from 'node:child_process';
+import { spawn } from 'node:child_process';
 import { access, mkdtemp, rm, stat, writeFile } from 'node:fs/promises';
 import { constants, existsSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
+
+import { terminateOwnedProcessTree as terminateProcessTree } from '../../skills/delegate-to-antigravity/scripts/lib/owned-process.mjs';
 
 import { McpServer } from '@modelcontextprotocol/server';
 import { serveStdio } from '@modelcontextprotocol/server/stdio';
@@ -68,17 +70,6 @@ async function runnerAvailable(): Promise<boolean> {
   }
 }
 
-function terminateProcessTree(child: ReturnType<typeof spawn>): void {
-  if (!child.pid) return;
-  if (process.platform === 'win32') {
-    spawnSync('taskkill', ['/PID', String(child.pid), '/T', '/F'], {
-      windowsHide: true,
-      stdio: 'ignore',
-    });
-  } else {
-    child.kill('SIGTERM');
-  }
-}
 
 function runProcess(command: string, args: string[], cwd: string, timeoutMs: number): Promise<RunResult> {
   return new Promise((resolve, reject) => {
@@ -86,25 +77,22 @@ function runProcess(command: string, args: string[], cwd: string, timeoutMs: num
       cwd,
       env: process.env,
       windowsHide: true,
+      detached: process.platform !== 'win32',
       stdio: ['ignore', 'pipe', 'pipe'],
     });
-    let stdout: Buffer<ArrayBufferLike> = Buffer.alloc(0);
-    let stderr: Buffer<ArrayBufferLike> = Buffer.alloc(0);
+    const stdout: Buffer<ArrayBufferLike>[] = [];
+    const stderr: Buffer<ArrayBufferLike>[] = [];
+    let stdoutBytes = 0;
+    let stderrBytes = 0;
     let truncated = false;
     let timedOut = false;
     let settled = false;
 
-    const append = (
-      current: Buffer<ArrayBufferLike>,
-      chunk: Buffer<ArrayBufferLike>,
-    ): Buffer<ArrayBufferLike> => {
-      if (current.length >= MAX_OUTPUT_BYTES) {
-        truncated = true;
-        return current;
-      }
-      const remaining = MAX_OUTPUT_BYTES - current.length;
-      if (chunk.length > remaining) truncated = true;
-      return Buffer.concat([current, chunk.subarray(0, remaining)]);
+    const append = (chunks: Buffer<ArrayBufferLike>[], length: number, chunk: Buffer<ArrayBufferLike>): number => {
+      const kept = Math.min(chunk.length, MAX_OUTPUT_BYTES - length);
+      if (kept < chunk.length) truncated = true;
+      if (kept > 0) chunks.push(Buffer.from(chunk.subarray(0, kept)));
+      return length + kept;
     };
 
     let timer: NodeJS.Timeout;
@@ -115,8 +103,8 @@ function runProcess(command: string, args: string[], cwd: string, timeoutMs: num
       callback();
     };
 
-    child.stdout.on('data', (chunk: Buffer<ArrayBufferLike>) => { stdout = append(stdout, chunk); });
-    child.stderr.on('data', (chunk: Buffer<ArrayBufferLike>) => { stderr = append(stderr, chunk); });
+    child.stdout.on('data', (chunk: Buffer<ArrayBufferLike>) => { stdoutBytes = append(stdout, stdoutBytes, chunk); });
+    child.stderr.on('data', (chunk: Buffer<ArrayBufferLike>) => { stderrBytes = append(stderr, stderrBytes, chunk); });
     child.on('error', (error) => finish(() => reject(error)));
 
     timer = setTimeout(() => {
@@ -126,8 +114,8 @@ function runProcess(command: string, args: string[], cwd: string, timeoutMs: num
 
     child.on('close', (exitCode) => finish(() => resolve({
       exitCode,
-      stdout: stdout.toString('utf8'),
-      stderr: stderr.toString('utf8'),
+      stdout: Buffer.concat(stdout, stdoutBytes).toString('utf8'),
+      stderr: Buffer.concat(stderr, stderrBytes).toString('utf8'),
       timedOut,
       truncated,
     })));
@@ -213,7 +201,7 @@ const delegateSchema = {
   ),
   isolation: z.enum(['worktree', 'shared']).optional(),
   resumeJobId: z.string().min(1).max(200).optional(),
-  retentionMinutes: z.number().int().min(10).max(10080).optional(),
+  retentionMinutes: z.number().int().min(10).max(10080).optional().describe('Reserved retention-policy metadata; automatic pruning is not implemented. Use explicit finalize for worktree cleanup.'),
   subagents: z.number().int().min(0).max(8).optional().describe(
     'Optional subagents limit (0..8). Omission uses controller auto policy.',
   ),
@@ -358,14 +346,8 @@ function createServer(): McpServer {
       let resolvedCwd: string;
       try {
         resolvedCwd = await validateWorkspace(cwd);
-        const check = await runnerCheck();
-        if (check.exitCode !== 0 || check.timedOut) {
-          return failure(check.stderr.trim() || 'Antigravity callback preflight failed');
-        }
-        const readiness = JSON.parse(check.stdout) as { codexCallbackAvailable?: boolean };
-        if (!readiness.codexCallbackAvailable) {
-          return failure('Codex CLI was not found; asynchronous callback dispatch is unavailable.');
-        }
+        // The async runner checks both agy and callback availability before
+        // persisting or spawning. Avoid a redundant full ledger/CPU health scan.
       } catch (error) {
         return failure(error instanceof Error ? error.message : String(error));
       }
@@ -419,7 +401,13 @@ function createServer(): McpServer {
       const payload = JSON.stringify({ ...(jobArgs ?? {}), ...(jobId ? { jobId } : {}) });
       const result = await runProcess(process.execPath, [runnerPath(), '--job-action', action, '--job-args-json', payload], pluginRoot(), 30_000);
       const text = result.stdout.trim() || result.stderr.trim() || '(runner returned no output)';
-      return { content: [{ type: 'text', text }], structuredContent: { action, jobId, exitCode: result.exitCode, artifactPaths: parseAgyMeta(result.stdout).artifactPaths ?? [] }, isError: result.exitCode !== 0 || result.timedOut };
+      if (result.exitCode !== 0 || result.timedOut) return failure(text);
+      if (result.truncated) return failure('Job response exceeded the output limit; use a more specific job query.');
+      let data: unknown;
+      try { data = JSON.parse(result.stdout); }
+      catch { return failure('Job action returned malformed JSON'); }
+      if (!data || typeof data !== 'object' || Array.isArray(data)) return failure('Job action returned an invalid result');
+      return { content: [{ type: 'text', text }], structuredContent: { ...data, action, jobId, exitCode: result.exitCode } };
     } catch (error) { return failure(`Failed to manage Antigravity job: ${error instanceof Error ? error.message : String(error)}`); }
   });
 
