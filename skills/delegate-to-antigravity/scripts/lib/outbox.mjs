@@ -89,7 +89,7 @@ export async function getOutboxRecord(root, jobId, attemptId) {
   }
 }
 
-export async function listOutboxRecords(root, { status } = {}) {
+export async function listOutboxRecords(root, { status, strict = false } = {}) {
   const outboxDir = getOutboxDir(root);
   try {
     const entries = await fsp.readdir(outboxDir, { withFileTypes: true });
@@ -98,10 +98,14 @@ export async function listOutboxRecords(root, { status } = {}) {
       if (entry.isFile() && entry.name.endsWith('.json') && !entry.name.startsWith('.')) {
         try {
           const rec = await readJson(path.join(outboxDir, entry.name));
+          if (strict && (!rec || typeof rec.jobId !== 'string' || !['pending', 'in_flight', 'delivered', 'exhausted'].includes(rec.status))) {
+            throw new Error(`Invalid outbox record: ${entry.name}`);
+          }
           if (!status || rec.status === status) {
             records.push(rec);
           }
-        } catch {
+        } catch (error) {
+          if (strict) throw error;
           // Ignore corrupt individual file during listing
         }
       }
@@ -166,8 +170,8 @@ export async function recordOutboxFailure(root, jobId, attemptId, error, options
   });
 }
 
-export async function hasPendingOutbox(root, jobId) {
-  const records = await listOutboxRecords(root);
+export async function hasPendingOutbox(root, jobId, options = {}) {
+  const records = await listOutboxRecords(root, options);
   return records.some(
     r => r.jobId === jobId && (r.status === 'pending' || r.status === 'in_flight')
   );

@@ -15,12 +15,12 @@ import {
   writeCancellationMarker,
   readCancellationMarker,
   terminateProcess,
-  terminateOwnedProcessTree,
   spawnDetachedWorker,
   WindowsProcessSupervisor,
 } from "../../skills/delegate-to-antigravity/scripts/lib/windows-process.mjs";
 
 import { withFileLock } from "../../skills/delegate-to-antigravity/scripts/lib/storage.mjs";
+import { terminateOwnedProcessTree } from "../../skills/delegate-to-antigravity/scripts/lib/owned-process.mjs";
 
 import {
   DEFAULT_MAX_SLOTS,
@@ -39,7 +39,7 @@ import {
   SlotLeaseManager,
 } from "../../skills/delegate-to-antigravity/scripts/lib/leases.mjs";
 
-describe("Windows Process Supervision and Max-Four Slot Leasing", () => {
+describe("Cross-platform Process Supervision and Slot Leasing", () => {
   let tmpRoot;
 
   beforeEach(async () => {
@@ -534,14 +534,18 @@ describe("Windows Process Supervision and Max-Four Slot Leasing", () => {
     it("spawns a detached process without shell command interpolation", async () => {
       const spawned = await spawnDetachedWorker({
         command: process.execPath,
-        args: ["-e", "process.exit(0)"],
+        args: ["-e", "setInterval(() => {}, 1000)"],
         windowsHide: true,
       });
 
-      assert.ok(spawned.pid > 0, "Spawned process must have valid PID");
-      assert.equal(spawned.identity.pid, spawned.pid);
-      assert.equal(spawned.identity.executable, process.execPath);
-      assert.ok(spawned.identity.creationTime);
+      try {
+        assert.ok(spawned.pid > 0, "Spawned process must have valid PID");
+        assert.equal(spawned.identity.pid, spawned.pid);
+        assert.equal(compareExecutables(spawned.identity.executable, process.execPath), true);
+        assert.ok(spawned.identity.creationTime);
+      } finally {
+        spawned.child.kill("SIGKILL");
+      }
     });
   });
 
@@ -711,24 +715,20 @@ describe("Windows Process Supervision and Max-Four Slot Leasing", () => {
     async function waitForExit(pid, timeoutMs = 3000) {
       const deadline = Date.now() + timeoutMs;
       while (Date.now() < deadline) {
-        try {
-          process.kill(pid, 0);
-        } catch {
-          return true;
-        }
+        if (!(await queryProcessIdentity(pid)).running) return true;
         await new Promise((resolve) => setTimeout(resolve, 50));
       }
       return false;
     }
 
-    it("recovers a lock directory whose owner record was never published", async () => {
+    it("preserves a lock directory whose owner record was never published", async () => {
       const lockPath = path.join(tmpRoot, "locks", "unpublished.lock");
       await fsp.mkdir(lockPath, { recursive: true });
 
       let ran = false;
-      await withFileLock(lockPath, async () => { ran = true; }, { staleMs: 0, maxWaitMs: 1000 });
-      assert.equal(ran, true);
-      await assert.rejects(fsp.stat(lockPath), { code: "ENOENT" });
+      await assert.rejects(withFileLock(lockPath, async () => { ran = true; }, { staleMs: 0, maxWaitMs: 50 }), /Timed out acquiring lock/);
+      assert.equal(ran, false);
+      await fsp.access(lockPath);
     });
 
     it("recovers a dead-owner lock but never steals a live owner", async () => {

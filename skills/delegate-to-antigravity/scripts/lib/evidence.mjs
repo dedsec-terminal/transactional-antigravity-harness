@@ -11,13 +11,9 @@ import {
   runGit,
   verifyWorktreeOwnership,
 } from "./git-worktree.mjs";
-import { canonicalJsonStringify } from "./storage.mjs";
 
-// Compatibility alias: manifest hashing must keep using sorted-key
-// serialization, so it reuses the single canonical implementation.
-export function deterministicJsonStringify(obj) {
-  return canonicalJsonStringify(obj);
-}
+import { canonicalJsonStringify as deterministicJsonStringify } from "./storage.mjs";
+export { deterministicJsonStringify };
 
 export function hashManifest(manifest) {
   return crypto.createHash("sha256").update(deterministicJsonStringify(manifest)).digest("hex");

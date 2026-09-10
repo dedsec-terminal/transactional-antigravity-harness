@@ -1,11 +1,13 @@
 #!/usr/bin/env node
 
-import { spawn, spawnSync } from 'node:child_process';
+import { spawn } from 'node:child_process';
 import { access, mkdtemp, rm, stat, writeFile } from 'node:fs/promises';
 import { constants, existsSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
+
+import { terminateOwnedProcessTree as terminateProcessTree } from '../../skills/delegate-to-antigravity/scripts/lib/owned-process.mjs';
 
 import { McpServer } from '@modelcontextprotocol/server';
 import { serveStdio } from '@modelcontextprotocol/server/stdio';
@@ -68,47 +70,7 @@ async function runnerAvailable(): Promise<boolean> {
   }
 }
 
-const KILL_GRACE_MS = 1_500;
 
-function processIsRunning(pid: number): boolean {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (error) {
-    return (error as NodeJS.ErrnoException).code !== 'ESRCH';
-  }
-}
-
-// Terminates the owned child tree: SIGTERM, a bounded grace period, then
-// SIGKILL to the child's dedicated process group (children are spawned
-// detached on POSIX). The orchestrator's own process group is never signaled.
-function terminateProcessTree(child: ReturnType<typeof spawn>): Promise<void> {
-  const pid = child.pid;
-  if (!pid || pid === process.pid) return Promise.resolve();
-  if (process.platform === 'win32') {
-    spawnSync('taskkill', ['/PID', String(pid), '/T', '/F'], {
-      windowsHide: true,
-      stdio: 'ignore',
-    });
-    return Promise.resolve();
-  }
-  try { child.kill('SIGTERM'); } catch { /* already gone */ }
-  return new Promise((resolve) => {
-    const started = Date.now();
-    const poll = setInterval(() => {
-      if (!processIsRunning(pid)) {
-        clearInterval(poll);
-        resolve();
-      } else if (Date.now() - started >= KILL_GRACE_MS) {
-        clearInterval(poll);
-        try { process.kill(-pid, 'SIGKILL'); }
-        catch { try { child.kill('SIGKILL'); } catch { /* already gone */ } }
-        resolve();
-      }
-    }, 50);
-    poll.unref();
-  });
-}
 
 function runProcess(command: string, args: string[], cwd: string, timeoutMs: number): Promise<RunResult> {
   return new Promise((resolve, reject) => {
@@ -141,7 +103,7 @@ function runProcess(command: string, args: string[], cwd: string, timeoutMs: num
       const remaining = MAX_OUTPUT_BYTES - captured;
       const piece = chunk.length > remaining ? chunk.subarray(0, remaining) : chunk;
       if (chunk.length > remaining) truncated = true;
-      chunks.push(piece);
+      chunks.push(Buffer.from(piece));
       return captured + piece.length;
     };
 
@@ -159,7 +121,19 @@ function runProcess(command: string, args: string[], cwd: string, timeoutMs: num
 
     timer = setTimeout(() => {
       timedOut = true;
-      void terminateProcessTree(child);
+      void terminateProcessTree(child).then(() => finish(() => {
+        child.stdout.destroy(); child.stderr.destroy(); child.unref();
+        resolve({
+        exitCode: null,
+        stdout: Buffer.concat(stdoutChunks).toString('utf8'),
+        stderr: Buffer.concat(stderrChunks).toString('utf8'),
+        timedOut: true,
+        truncated,
+        });
+      })).catch(() => finish(() => {
+        child.stdout.destroy(); child.stderr.destroy(); child.unref();
+        resolve({ exitCode: null, stdout: '', stderr: 'Process cleanup failed', timedOut: true, truncated });
+      }));
     }, timeoutMs);
 
     child.on('close', (exitCode) => finish(() => resolve({
@@ -251,7 +225,7 @@ const delegateSchema = {
   ),
   isolation: z.enum(['worktree', 'shared']).optional(),
   resumeJobId: z.string().min(1).max(200).optional(),
-  retentionMinutes: z.number().int().min(10).max(10080).optional(),
+  retentionMinutes: z.number().int().min(10).max(10080).optional().describe('Reserved retention-policy metadata; automatic pruning is not implemented. Use explicit finalize for worktree cleanup.'),
   subagents: z.number().int().min(0).max(8).optional().describe(
     'Optional subagents limit (0..8). Omission uses controller auto policy.',
   ),
@@ -396,14 +370,8 @@ function createServer(): McpServer {
       let resolvedCwd: string;
       try {
         resolvedCwd = await validateWorkspace(cwd);
-        const check = await runnerCheck();
-        if (check.exitCode !== 0 || check.timedOut) {
-          return failure(check.stderr.trim() || 'Antigravity callback preflight failed');
-        }
-        const readiness = JSON.parse(check.stdout) as { codexCallbackAvailable?: boolean };
-        if (!readiness.codexCallbackAvailable) {
-          return failure('Codex CLI was not found; asynchronous callback dispatch is unavailable.');
-        }
+        // The async runner checks both agy and callback availability before
+        // persisting or spawning. Avoid a redundant full ledger/CPU health scan.
       } catch (error) {
         return failure(error instanceof Error ? error.message : String(error));
       }
@@ -457,7 +425,13 @@ function createServer(): McpServer {
       const payload = JSON.stringify({ ...(jobArgs ?? {}), ...(jobId ? { jobId } : {}) });
       const result = await runProcess(process.execPath, [runnerPath(), '--job-action', action, '--job-args-json', payload], pluginRoot(), 30_000);
       const text = result.stdout.trim() || result.stderr.trim() || '(runner returned no output)';
-      return { content: [{ type: 'text', text }], structuredContent: { action, jobId, exitCode: result.exitCode, artifactPaths: parseAgyMeta(result.stdout).artifactPaths ?? [] }, isError: result.exitCode !== 0 || result.timedOut };
+      if (result.exitCode !== 0 || result.timedOut) return failure(text);
+      if (result.truncated) return failure('Job response exceeded the output limit; use a more specific job query.');
+      let data: unknown;
+      try { data = JSON.parse(result.stdout); }
+      catch { return failure('Job action returned malformed JSON'); }
+      if (!data || typeof data !== 'object' || Array.isArray(data)) return failure('Job action returned an invalid result');
+      return { content: [{ type: 'text', text }], structuredContent: { ...data, action, jobId, exitCode: result.exitCode } };
     } catch (error) { return failure(`Failed to manage Antigravity job: ${error instanceof Error ? error.message : String(error)}`); }
   });
 

@@ -15,6 +15,19 @@ assert.equal(denial.ok, false);
 assert.equal(denial.permissionDenied, true);
 assert.equal(denial.failureCode, 126);
 
+for (const stderr of ['Warning: --print-timeout expired; returning partial output.', 'warning: print timeout reached']) {
+  const outcome = classifyOutcome({ exitCode: 0, stderr }, { status: 'SUCCESS', response: 'partial' });
+  assert.equal(outcome.ok, false);
+  assert.equal(outcome.timedOut, true);
+  assert.equal(outcome.failureCode, 124);
+}
+assert.equal(classifyOutcome({ exitCode: 0, stderr: 'error: model request failed' }, {
+  status: 'SUCCESS', response: 'partial',
+}).cliError, true);
+assert.equal(classifyOutcome({ exitCode: 0, stderr: '' }, {
+  status: 'SUCCESS', response: 'Documented warning: --print-timeout expired.',
+}).ok, true);
+
 const here = path.dirname(fileURLToPath(import.meta.url));
 const root = await fsp.mkdtemp(path.join(os.tmpdir(), 'agy-mcp-deterministic-'));
 const serverDir = path.join(root, 'mcp', 'dist');

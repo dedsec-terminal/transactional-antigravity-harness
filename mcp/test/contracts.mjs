@@ -315,8 +315,8 @@ test("Isolation matrix and constants", () => {
   assert.deepEqual(VALID_ISOLATION_MODES, ["shared", "worktree"]);
   assert.equal(DEFAULT_RETENTION_MINUTES, 1440);
   assert.equal(EVIDENCE_RETENTION_DAYS, 14);
-  assert.equal(MAX_WORKER_SLOTS, 4);
-  assert.equal(MAX_CONCURRENT_SLOTS, 4);
+  assert.equal(MAX_WORKER_SLOTS, 8);
+  assert.equal(MAX_CONCURRENT_SLOTS, 8);
 
   // Matrix cell 1: sync plan => default shared, explicit shared allowed, explicit worktree allowed
   assert.equal(getDefaultIsolation({ mode: "plan", isAsync: false }), "shared");

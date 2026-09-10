@@ -12,7 +12,6 @@ import {
   withFileLock,
 } from './storage.mjs';
 import { hasPendingOutbox, listOutboxRecords } from './outbox.mjs';
-import { finalizeWorktree } from './git-worktree.mjs';
 
 export const DEFAULT_EVIDENCE_RETENTION_MS = 14 * 24 * 60 * 60 * 1000;
 export const DEFAULT_WORKTREE_RETENTION_MS = 24 * 60 * 60 * 1000;
@@ -520,6 +519,15 @@ export async function sealAttempt(root, jobId, attemptId, patch = {}, options = 
   return nextState;
 }
 
+function validateRetentionOptions(now, retentionMs) {
+  if (!Number.isFinite(now) || !Number.isFinite(new Date(now).getTime())) {
+    throw new TypeError('now must be a finite epoch timestamp in milliseconds');
+  }
+  if (!Number.isFinite(retentionMs) || retentionMs < 0) {
+    throw new TypeError('retentionMs must be a finite non-negative number');
+  }
+}
+
 export function evaluateJobRetention(job, options = {}) {
   const {
     now = Date.now(),
@@ -527,6 +535,7 @@ export function evaluateJobRetention(job, options = {}) {
     hasPendingOutboxRecord = false,
   } = options;
 
+  validateRetentionOptions(now, retentionMs);
   const reasons = [];
 
   const isTerminalLifecycle = TERMINAL_STATES.lifecycle.has(job.state?.lifecycle);
@@ -547,9 +556,13 @@ export function evaluateJobRetention(job, options = {}) {
     reasons.push('corrupt');
   }
 
-  const updatedAtMs = Date.parse(job.state?.updatedAt || job.manifest?.createdAt || 0);
-  const ageMs = now - updatedAtMs;
-  if (ageMs < retentionMs) {
+  // Only fall back for absent timestamps, never for malformed values. Unknown
+  // age must preserve evidence rather than silently bypass the retention window.
+  const timestamp = job.state?.updatedAt ?? job.manifest?.createdAt;
+  const updatedAtMs = typeof timestamp === 'string' ? Date.parse(timestamp) : NaN;
+  if (!Number.isFinite(updatedAtMs)) {
+    reasons.push('invalid_timestamp');
+  } else if (now - updatedAtMs < retentionMs) {
     reasons.push('within_retention_window');
   }
 
@@ -557,21 +570,10 @@ export function evaluateJobRetention(job, options = {}) {
   return { eligible, reasons };
 }
 
-async function pathExists(targetPath) {
-  try {
-    await fsp.stat(targetPath);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
 /**
- * Maintenance sweep. Evidence directories are collected only after the
- * evidence retention window (default 14 days); finalized worktrees still on
- * disk past the worktree window (default 24 hours) are disposed through the
- * ordinary verified cleanup path. Dry-run is supported and lists what the
- * sweep would do without touching disk.
+ * Explicit evidence maintenance after verified finalization. Worktrees must
+ * be finalized through the controller; collection never infers ownership or
+ * cleanup permission from a retention deadline.
  */
 export async function collectEligibleJobs(root, options = {}) {
   const {
@@ -581,6 +583,10 @@ export async function collectEligibleJobs(root, options = {}) {
     worktreeRetentionMs = DEFAULT_WORKTREE_RETENTION_MS,
     dryRun = false,
   } = options;
+
+  validateRetentionOptions(now, evidenceRetentionMs);
+  validateRetentionOptions(now, worktreeRetentionMs);
+  if (typeof dryRun !== 'boolean') throw new TypeError('dryRun must be a boolean');
 
   const resolvedRoot = resolveAgyRoot(root);
   const jobsDir = path.join(resolvedRoot, 'jobs');
@@ -597,14 +603,16 @@ export async function collectEligibleJobs(root, options = {}) {
 
   // Read pending callbacks once per sweep instead of once per job.
   const pendingJobIds = new Set();
+  let outboxUnavailable = false;
   try {
-    for (const record of await listOutboxRecords(root)) {
+    for (const record of await listOutboxRecords(root, { strict: true })) {
       if (record.status === 'pending' || record.status === 'in_flight') {
         pendingJobIds.add(record.jobId);
       }
     }
   } catch {
-    // Unreadable outbox: fall back to per-job checks so nothing is collected blindly.
+    // An unreadable outbox cannot prove callbacks are drained. Fail closed.
+    outboxUnavailable = true;
   }
 
   const collected = [];
@@ -632,7 +640,7 @@ export async function collectEligibleJobs(root, options = {}) {
     const evaluation = evaluateJobRetention(job, {
       now,
       retentionMs: evidenceRetentionMs,
-      hasPendingOutboxRecord: pendingJobIds.has(jobId),
+      hasPendingOutboxRecord: outboxUnavailable || pendingJobIds.has(jobId),
     });
 
     if (evaluation.eligible) {
@@ -640,15 +648,15 @@ export async function collectEligibleJobs(root, options = {}) {
         collected.push(jobId);
         continue;
       }
-      // Recheck the specific job under the lifecycle lock immediately before
-      // deletion so a concurrent state change or callback enqueue wins.
+      // Serialize against job state updates and re-read callback evidence
+      // immediately before deletion. Failed reads never authorize collection.
       const deleted = await withFileLock(path.join(jobDir, '.state.lock'), async () => {
-        let fresh = job;
-        try { fresh = await getJob(root, jobId); } catch { /* keep the original snapshot */ }
+        let fresh;
+        try { fresh = await getJob(root, jobId); } catch { return false; }
         const recheck = evaluateJobRetention(fresh, {
           now,
           retentionMs: evidenceRetentionMs,
-          hasPendingOutboxRecord: await hasPendingOutbox(root, jobId),
+          hasPendingOutboxRecord: outboxUnavailable || await hasPendingOutbox(root, jobId, { strict: true }),
         });
         if (!recheck.eligible) return false;
         await fsp.rm(jobDir, { recursive: true, force: true });
@@ -661,25 +669,6 @@ export async function collectEligibleJobs(root, options = {}) {
 
     skipped.push({ jobId, reasons: evaluation.reasons });
 
-    const worktreePath = job.manifest?.metadata?.worktreePath;
-    if (
-      worktreePath
-      && job.state?.finalized === true
-      && TERMINAL_STATES.lifecycle.has(job.state?.lifecycle)
-      && now - Date.parse(job.state?.updatedAt || 0) > worktreeRetentionMs
-      && await pathExists(worktreePath)
-    ) {
-      if (dryRun) {
-        worktrees.push({ jobId, worktreePath, status: 'retention_elapsed' });
-      } else {
-        try {
-          const cleanup = await finalizeWorktree(worktreePath, { repoRoot: job.manifest.cwd });
-          worktrees.push({ jobId, worktreePath, status: cleanup.status, error: cleanup.error });
-        } catch (err) {
-          worktrees.push({ jobId, worktreePath, status: 'error', error: err.message });
-        }
-      }
-    }
   }
 
   return { collected, skipped, worktrees };
@@ -728,7 +717,7 @@ export async function checkStorageHealth(root) {
   }
 
   return {
-    healthy: true,
+    healthy: corruptJobs === 0,
     root: resolvedRoot,
     totalJobs,
     activeJobs,

@@ -8,10 +8,11 @@ import { enqueueOutboxRecord, getPendingOutboxRecords, listOutboxRecords, record
 import { acquireSlot, activateReservedSlot, getActiveCount, getCounts, reclaimLeases, releaseSlot, reserveSlot } from "./leases.mjs";
 import { sampleSystemCapacity, recommendWorkerCapacity, DEFAULT_MAX_WORKERS } from "./system-capacity.mjs";
 import { appendActivityEvent, readActivityEvents } from "./activity.mjs";
-import { canonicalPath, createWorktree, finalizeWorktree, listWorktrees, runGit, validateRepository, verifyWorktreeOwnership } from "./git-worktree.mjs";
+import { canonicalPath, createWorktree, finalizeWorktree, listWorktrees, validateRepository, verifyWorktreeOwnership } from "./git-worktree.mjs";
 import { captureEvidence } from "./evidence.mjs";
 import { applyPatch } from "./apply.mjs";
 import { terminateProcess } from "./windows-process.mjs";
+import { classifyOutcome } from "../agy-outcome.mjs";
 
 async function appendJobActivity(stateRoot, jobId, event) {
   try {
@@ -360,10 +361,14 @@ function executionState(result, protocolOkay) {
   if (result.timedOut) return "timed_out";
   if (result.permissionDenied) return "denied";
   if (result.cancelled) return "cancelled";
+  if (result.cliError) return "failed";
   return result.exitCode === 0 && protocolOkay ? "succeeded" : "failed";
 }
 
 export async function completeRun(root, jobId, attemptId, result) {
+  const cliOutcome = classifyOutcome(result, parseTerminalResult(result.stdout)?.result);
+  result = { ...result, timedOut: cliOutcome.timedOut, cliError: cliOutcome.cliError,
+    permissionDenied: Boolean(result.permissionDenied || cliOutcome.permissionDenied) };
   const context = await getRunContext(root, jobId, attemptId);
   const { attempt, request } = context;
   await appendJobActivity(context.root, jobId, { phase: "verifying" });
@@ -473,13 +478,13 @@ async function reconcileJobs(stateRoot, options = {}) {
 
 // Crash recovery for an interrupted finalize: the intent was persisted after
 // ownership verification, so a missing directory on retry means removal
-// happened. Git registration is still rechecked and pruned before accepting it.
+// happened. Git registration is rechecked without pruning unrelated worktrees.
 async function reconcileRemovedWorktree(worktreePath, repoRoot) {
-  runGit(["worktree", "prune"], { cwd: repoRoot, allowFailure: true });
-  const target = canonicalPath(worktreePath).toLowerCase();
-  const stillRegistered = listWorktrees(repoRoot).some((tree) => tree.worktree.toLowerCase() === target);
+  const comparable = value => process.platform === 'win32' ? canonicalPath(value).toLowerCase() : canonicalPath(value);
+  const target = comparable(worktreePath);
+  const stillRegistered = listWorktrees(repoRoot).some((tree) => comparable(tree.worktree) === target);
   if (stillRegistered) {
-    return { status: "pending_prune", worktreePath, error: "worktree is still registered after interrupted cleanup" };
+    return { status: "pending_prune", worktreePath, error: "worktree is still registered after interrupted cleanup; explicit registration repair required" };
   }
   return { status: "removed", worktreePath, reconciled: true };
 }
@@ -487,10 +492,11 @@ async function reconcileRemovedWorktree(worktreePath, repoRoot) {
 // Explicit, dry-run-first retention maintenance. Kept off the hot path and
 // out of every delegation so evidence is only collected when an operator asks.
 async function collectJobs(stateRoot, options = {}) {
+  if (options.dryRun !== undefined && typeof options.dryRun !== 'boolean') throw new TypeError('dryRun must be a boolean');
   const dryRun = options.dryRun !== false;
-  const now = Number(options.now ?? Date.now());
-  const evidenceRetentionMs = Number(options.evidenceRetentionMs ?? options.retentionMs ?? DEFAULT_EVIDENCE_RETENTION_MS);
-  const worktreeRetentionMs = Number(options.worktreeRetentionMs ?? DEFAULT_WORKTREE_RETENTION_MS);
+  const now = options.now ?? Date.now();
+  const evidenceRetentionMs = options.evidenceRetentionMs ?? options.retentionMs ?? DEFAULT_EVIDENCE_RETENTION_MS;
+  const worktreeRetentionMs = options.worktreeRetentionMs ?? DEFAULT_WORKTREE_RETENTION_MS;
   if (![now, evidenceRetentionMs, worktreeRetentionMs].every((value) => Number.isFinite(value) && value >= 0)) {
     throw new Error("collect requires finite non-negative now, evidenceRetentionMs, and worktreeRetentionMs");
   }
@@ -520,9 +526,15 @@ export async function runJobAction(root, action, jobId, options = {}) {
   if (action === "reconcile") return reconcileJobs(stateRoot, options);
   if (action === "cancel") {
     const attemptId = job.state.activeAttemptId;
+    if (!attemptId) return { action, jobId, cancelled: false, reason: "no_active_worker" };
     const attempt = await getAttempt(stateRoot, jobId, attemptId);
     if (attempt.state.sealed) return { action, jobId, cancelled: false, reason: "attempt_terminal" };
-    const worker = await readJson(path.join(attempt.attemptDir, "worker.json"));
+    let worker;
+    try { worker = await readJson(path.join(attempt.attemptDir, "worker.json")); }
+    catch (err) {
+      if (err.code === "ENOENT") return { action, jobId, cancelled: false, reason: "no_active_worker" };
+      throw err;
+    }
     const stopped = await terminateProcess({ pid: worker.identity.pid, identity: worker.identity, cancellationMarkerPath: path.join(attempt.attemptDir, "cancel.json") });
     if (!stopped.stopped) return { action, jobId, cancelled: false, stopped };
     await releaseWorker(stateRoot, jobId, attemptId);
@@ -543,10 +555,16 @@ export async function runJobAction(root, action, jobId, options = {}) {
     const worktreePath = attempt.manifest.metadata?.worktreePath;
     if (worktreePath) {
       const intent = job.state.finalizeIntent;
+      const samePath = (left, right) => typeof left === 'string' && typeof right === 'string'
+        && (process.platform === 'win32'
+          ? canonicalPath(left).toLowerCase() === canonicalPath(right).toLowerCase()
+          : canonicalPath(left) === canonicalPath(right));
       const intentMatches = Boolean(intent?.worktreePath)
-        && canonicalPath(intent.worktreePath).toLowerCase() === canonicalPath(worktreePath).toLowerCase()
-        && (!intent.marker?.repoRoot
-          || canonicalPath(intent.marker.repoRoot).toLowerCase() === canonicalPath(job.manifest.cwd).toLowerCase());
+        && intent.marker?.harness === 'antigravity-delegation-harness'
+        && intent.marker?.callerId === jobId
+        && samePath(intent.worktreePath, worktreePath)
+        && samePath(intent.marker.worktreePath, worktreePath)
+        && samePath(intent.marker.repoRoot, job.manifest.cwd);
       if (!intentMatches) {
         const verified = await verifyWorktreeOwnership(worktreePath, { repoRoot: job.manifest.cwd });
         await updateJobState(stateRoot, jobId, {

@@ -25,101 +25,48 @@ export async function ensureDir(dirPath) {
   return dirPath;
 }
 
-function lockOwnerPath(lockPath) {
-  return path.join(lockPath, 'owner.json');
-}
-
-async function readLockOwner(lockPath) {
-  try {
-    return JSON.parse(await fsp.readFile(lockOwnerPath(lockPath), 'utf8'));
-  } catch {
-    return null;
-  }
-}
-
-function processIsAlive(pid) {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (err) {
-    return err.code !== 'ESRCH';
-  }
-}
-
-// A lock is abandoned when its owner record proves the owner is dead, or when
-// publication never completed (no readable record) and the lock is older than
-// the stale window. A record that exists but cannot be verified never qualifies.
-async function lockIsAbandoned(lockPath, staleMs) {
-  const info = await readLockOwner(lockPath);
-  if (info && typeof info.owner === 'string' && Number.isInteger(info.pid) && info.pid > 0) {
-    return !processIsAlive(info.pid);
-  }
-  let stat;
-  try {
-    stat = await fsp.stat(lockPath);
-  } catch {
-    return false;
-  }
-  return Date.now() - stat.mtimeMs > staleMs;
-}
-
-// Publishes the lock directory with its owner record inside. rename() is atomic
-// and fails when the lock already exists, so two contenders can never both
-// believe they created it and a crash cannot leave an empty lock behind.
-async function publishLockDirectory(lockPath, ownerRecord, randomId) {
-  const stagingPath = `${lockPath}.publish.${randomId()}`;
-  await fsp.mkdir(stagingPath);
-  try {
-    await fsp.writeFile(lockOwnerPath(stagingPath), JSON.stringify(ownerRecord), 'utf8');
-    await fsp.rename(stagingPath, lockPath);
-  } catch (err) {
-    await fsp.rm(stagingPath, { recursive: true, force: true }).catch(() => {});
-    throw err;
-  }
-}
-
-// Removes an abandoned lock by atomically renaming it aside first. Only one
-// contender can win that rename, and the moved record is re-verified before
-// deletion so a replacement lock is restored instead of stolen.
-async function removeAbandonedLock(lockPath, expectedOwner, randomId) {
-  const graveyardPath = `${lockPath}.reclaim.${randomId()}`;
-  try {
-    await fsp.rename(lockPath, graveyardPath);
-  } catch (err) {
-    if (err.code === 'ENOENT') return true;
-    throw err;
-  }
-  const moved = await readLockOwner(graveyardPath);
-  const movedOwner = moved && typeof moved.owner === 'string' ? moved.owner : null;
-  if (movedOwner !== expectedOwner) {
-    try { await fsp.rename(graveyardPath, lockPath); }
-    catch { /* keep the moved lock on disk rather than delete one that may be live */ }
-    return false;
-  }
-  await fsp.rm(graveyardPath, { recursive: true, force: true }).catch(() => {});
-  return true;
-}
-
-// Cross-process lock with an atomically published ownership record. A live or
-// unverifiable owner is never stolen; dead owners and incomplete publications
-// are reclaimed under an atomic claim so only one contender can recover.
+// Cross-process lock with an ownership nonce. A live owner is never stolen;
+// callers wait until it releases (or an owner that is provably dead is stale).
 export async function withFileLock(lockPath, fn, options = {}) {
-  const { retryDelayMs = 10, maxWaitMs = 30000, staleMs = 120000, randomId = generateUuid } = options;
-  const owner = `${process.pid}:${randomId()}`;
+  const { retryDelayMs = 10, maxWaitMs = 30000 } = options;
+  const nonce = generateUuid();
+  const owner = `${process.pid}:${nonce}`;
+  const ownerFile = path.join(lockPath, `owner-${nonce}.json`);
   const started = Date.now();
   let acquired = false;
   while (!acquired) {
     try {
-      await publishLockDirectory(lockPath, { owner, pid: process.pid, createdAt: Date.now() }, randomId);
+      await fsp.mkdir(lockPath);
+      try {
+        await fsp.writeFile(ownerFile, JSON.stringify({ owner, pid: process.pid, createdAt: Date.now() }), { flag: 'wx' });
+      } catch (err) {
+        await fsp.unlink(ownerFile).catch(() => {});
+        await fsp.rmdir(lockPath).catch(() => {});
+        throw err;
+      }
       acquired = true;
     } catch (err) {
-      if (!['EEXIST', 'ENOTEMPTY', 'ENOTDIR', 'EPERM', 'EACCES', 'EBUSY'].includes(err.code)) throw err;
-      const info = await readLockOwner(lockPath);
-      const expectedOwner = info && typeof info.owner === 'string' ? info.owner : null;
-      if (await lockIsAbandoned(lockPath, staleMs)) {
-        await removeAbandonedLock(lockPath, expectedOwner, randomId);
-        continue;
-      }
+      if (err.code !== 'EEXIST' && err.code !== 'ENOENT') throw err;
+      try {
+        const entries = await fsp.readdir(lockPath);
+        // Read old owner.json records too, but never recursively remove the
+        // directory: a concurrent reclaimer may already have replaced it.
+        const owners = entries.filter(name => name === 'owner.json' || /^owner-[a-f0-9-]+\.json$/.test(name));
+        if (owners.length === 1) {
+          const observedFile = path.join(lockPath, owners[0]);
+          const info = JSON.parse(await fsp.readFile(observedFile, 'utf8'));
+          let dead = false;
+          if (info.owner && Number.isSafeInteger(info.pid) && info.pid > 0) {
+            try { process.kill(info.pid, 0); } catch (probe) { dead = probe.code === 'ESRCH'; }
+          }
+          if (dead) {
+            // The unique filename prevents a late reclaimer from unlinking a
+            // replacement owner's record. rmdir refuses nonempty directories.
+            await fsp.unlink(observedFile).catch(() => {});
+            await fsp.rmdir(lockPath).catch(() => {});
+          }
+        }
+      } catch { /* Unknown or incomplete ownership is never stolen by age. */ }
       if (Date.now() - started >= maxWaitMs) throw new Error(`Timed out acquiring lock ${lockPath}`);
       await new Promise(resolve => setTimeout(resolve, retryDelayMs));
     }
@@ -127,9 +74,12 @@ export async function withFileLock(lockPath, fn, options = {}) {
   try { return await fn(); }
   finally {
     try {
-      const info = JSON.parse(await fsp.readFile(lockOwnerPath(lockPath), 'utf8'));
-      if (info.owner === owner) await fsp.rm(lockPath, { recursive: true, force: true });
-    } catch { /* preserve lock if ownership cannot be verified */ }
+      const info = JSON.parse(await fsp.readFile(ownerFile, 'utf8'));
+      if (info.owner === owner) {
+        await fsp.unlink(ownerFile);
+        await fsp.rmdir(lockPath);
+      }
+    } catch { /* Preserve lock if ownership cannot be verified. */ }
   }
 }
 
@@ -370,33 +320,16 @@ export function captureBoundedBuffer(input, maxBytes = MAX_STREAM_CAPTURE_BYTES)
 }
 
 export function createBoundedStreamCollector(maxBytes = MAX_STREAM_CAPTURE_BYTES) {
+  if (!Number.isSafeInteger(maxBytes) || maxBytes < 0) throw new TypeError('maxBytes must be a non-negative safe integer');
   const headTarget = Math.floor(maxBytes / 2);
   const tailTarget = maxBytes - headTarget;
   let totalBytes = 0;
   const hash = crypto.createHash('sha256');
-  let headChunks = [];
-  let headLength = 0;
-  let headBuffer = null;
-  let tailChunks = [];
-  let tailLength = 0;
+  let chunks = [];
   let truncated = false;
-
-  // Keeps only the last tailTarget bytes in the queue; whole chunks fall off
-  // the front and a single boundary chunk is trimmed in place. Concatenation
-  // happens once in finish(), so appending is amortized instead of O(n^2).
-  function appendTail(buf) {
-    tailChunks.push(buf);
-    tailLength += buf.length;
-    while (tailChunks.length > 1 && tailLength - tailChunks[0].length >= tailTarget) {
-      tailLength -= tailChunks[0].length;
-      tailChunks.shift();
-    }
-    if (tailLength > tailTarget) {
-      const overflow = tailLength - tailTarget;
-      tailChunks[0] = tailChunks[0].subarray(overflow);
-      tailLength -= overflow;
-    }
-  }
+  let headBuffer = Buffer.alloc(0);
+  let tailBuffer = Buffer.alloc(0);
+  let tailPosition = 0;
 
   return {
     write(chunk) {
@@ -406,23 +339,37 @@ export function createBoundedStreamCollector(maxBytes = MAX_STREAM_CAPTURE_BYTES
       hash.update(buf);
 
       if (!truncated) {
-        headChunks.push(buf);
-        headLength += buf.length;
-        if (headLength > maxBytes) {
+        chunks.push(buf);
+        if (totalBytes > maxBytes) {
           truncated = true;
-          const combined = Buffer.concat(headChunks);
-          headBuffer = combined.subarray(0, headTarget);
-          appendTail(combined.subarray(combined.length - tailTarget));
-          headChunks = null;
+          // Copy only retained bytes, even if a single input chunk is huge.
+          headBuffer = Buffer.concat(chunks, headTarget);
+          if (buf.length >= tailTarget) {
+            tailBuffer = Buffer.from(buf.subarray(buf.length - tailTarget));
+          } else {
+            const combined = Buffer.concat(chunks);
+            tailBuffer = Buffer.from(combined.subarray(combined.length - tailTarget));
+          }
+          chunks = null;
         }
       } else {
-        appendTail(buf);
+        // Fixed-size circular tail: each incoming byte is copied at most once.
+        if (tailTarget === 0) return;
+        if (buf.length >= tailTarget) {
+          buf.copy(tailBuffer, 0, buf.length - tailTarget);
+          tailPosition = 0;
+        } else {
+          const first = Math.min(buf.length, tailTarget - tailPosition);
+          buf.copy(tailBuffer, tailPosition, 0, first);
+          buf.copy(tailBuffer, 0, first);
+          tailPosition = (tailPosition + buf.length) % tailTarget;
+        }
       }
     },
     finish() {
       const digest = hash.digest('hex');
       if (!truncated) {
-        const full = Buffer.concat(headChunks);
+        const full = Buffer.concat(chunks);
         const str = full.toString('utf8');
         return {
           truncated: false,
@@ -438,7 +385,9 @@ export function createBoundedStreamCollector(maxBytes = MAX_STREAM_CAPTURE_BYTES
         };
       }
 
-      const tailBuffer = Buffer.concat(tailChunks);
+      if (tailPosition) {
+        tailBuffer = Buffer.concat([tailBuffer.subarray(tailPosition), tailBuffer.subarray(0, tailPosition)]);
+      }
       const droppedBytes = totalBytes - (headBuffer.length + tailBuffer.length);
       const headContent = headBuffer.toString('utf8');
       const tailContent = tailBuffer.toString('utf8');

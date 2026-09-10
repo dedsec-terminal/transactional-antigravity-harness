@@ -116,11 +116,12 @@ flowchart TD
 2. **Untrusted Worker Principle**: Worker claims are untrusted by default. The parent orchestrator inspects actual git/filesystem diffs and executes automated tests before changes are accepted.
 3. **Explicit Apply & Finalize**: Completed worktree changes are never merged automatically. The parent orchestrator reviews the patch hash, applies verified changes, and cleans up the worktree.
 4. **Path Traversal Protection**: Target paths are constrained to the workspace root; directory traversal (`..`) attempts outside the workspace are rejected.
-5. **Retention Policies**:
+5. **Retention and Cleanup**:
 
-   * **Worktrees**: Removed by explicit finalize; a finalized worktree that is still on disk (for example `pending_prune` after an open-handle failure) is retried by maintenance after the 24-hour worktree window.
-   * **Evidence Ledger**: Job logs, terminal events, and hashes are kept for 14 days for forensic traceability.
-   * **Maintenance**: Collection is explicit and dry-run first. `agy_job` with `action: "collect"` previews eligible evidence; `args: { "dryRun": false }` applies the 14-day evidence and 24-hour worktree windows. Active, unfinalized, callback-pending, and corrupt jobs are never collected.
+   * **Worktrees**: Removed only by explicit `agy_job finalize`, including retries after busy-file failures. The 24-hour worktree retention setting is policy metadata, not a deletion timer; `collect` never removes worktrees.
+   * **Evidence Ledger**: `agy_job` with `action: "collect"` previews finalized evidence older than 14 days. Pass `args: { "dryRun": false }` to delete eligible evidence. This is explicit maintenance, not a scheduled background sweep.
+   * **Fail-safe Cleanup Library**: `collectEligibleJobs` uses a 14-day evidence window. It preserves active, unfinalized, callback-pending and corrupt jobs, and jobs with missing or malformed retention timestamps (`invalid_timestamp`). Invalid clocks and negative/non-finite retention windows are rejected; unreadable callback records block collection.
+   * **Blocked Leases**: New owner-bearing slot locks recover when their owner is provably dead. Legacy nonce-only locks and corrupt leases are reported as blocked capacity and preserved. Verify no worker is still using the slot before manual repair; malformed data is not proof that a worker has stopped.
 
 ---
 
@@ -131,6 +132,8 @@ flowchart TD
 * **Git**: Installed and available on `PATH`
 * **Google Antigravity CLI**: `agy` installed and authenticated on your local machine (`agy.exe` on `PATH` or in `%LOCALAPPDATA%\agy\bin\` on Windows).
 * **OpenAI Codex CLI** *(optional, required for async notifications)*: Installed and available on `PATH` to deliver asynchronous callbacks via `codex queue`.
+
+AGY 1.1.28 and later can return partial output with exit code zero when `--print-timeout` expires. The harness treats CLI timeout warnings as incomplete execution and preserves the artifact for review; a zero exit code alone never authorizes apply. See the [official CLI changelog](https://github.com/google-antigravity/antigravity-cli/blob/main/CHANGELOG.md).
 
 ---
 
@@ -241,6 +244,9 @@ Synchronously delegates a bounded task to Antigravity and waits for the result.
 * `timeoutSeconds` (number, default `300`): Execution timeout (1–1800s). Sizing target is under 25s.
 * `outputFormat` (`"text"` | `"json"`, default `"text"`): Desired output structure.
 * `resumeJobId` (string, optional): Resume a prior job attempt in its existing worktree.
+* `agent` (string, optional): Antigravity agent identifier, forwarded as `--agent`.
+* `model` (string, optional): Antigravity model identifier, forwarded as `--model`. When omitted, the harness uses the CLI's configured default rather than pinning a model.
+* `retentionMinutes` (integer, optional, 10–10080): Reserved policy metadata; currently does not schedule deletion. Use explicit `agy_job finalize` for worktree cleanup.
 
 ```json
 {
@@ -274,7 +280,7 @@ Dispatches a background worker task and returns an immediate acknowledgement. Wh
 ```
 
 ### `agy_job`
-Inspects or manages the lifecycle of transactional jobs.
+Inspects or manages the lifecycle of transactional jobs. Successful responses include the parsed job-action result in MCP `structuredContent`, including `state` and `attempts[].artifactPaths` for status, or `jobs` for list. The JSON text response is retained for compatibility.
 
 **Parameters**:
 

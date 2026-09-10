@@ -7,20 +7,20 @@ import {
   validateProcessIdentity,
   terminateProcess,
 } from "./windows-process.mjs";
-import { withFileLock } from "./storage.mjs";
 
-export const DEFAULT_MAX_SLOTS = 4;
+import { withFileLock, writeJsonAtomic } from "./storage.mjs";
+import { DEFAULT_MAX_WORKERS } from "./system-capacity.mjs";
+
+export const DEFAULT_MAX_SLOTS = DEFAULT_MAX_WORKERS;
 export const DEFAULT_STALE_TIMEOUT_MS = 300_000; // 5 minutes
 
-// Non-blocking slot guard built on the shared lock primitive, so a crashed
-// guard holder is recovered by owner identity instead of wedging the slot.
 async function withSlotLock(slotPath, fn) {
   try {
-    return await withFileLock(`${slotPath}.lock`, fn, { maxWaitMs: 0 });
+    // Owner-bearing directory locks recover provably dead controllers. Unknown
+    // owners (including old nonce-only files) remain blocked, never stolen.
+    return await withFileLock(`${slotPath}.lock`, () => fn(), { maxWaitMs: 50 });
   } catch (err) {
-    if (err instanceof Error && /^Timed out acquiring lock /.test(err.message)) {
-      return { locked: true };
-    }
+    if (err.message.startsWith("Timed out acquiring lock ")) return { locked: true };
     throw err;
   }
 }
@@ -49,7 +49,7 @@ export function getSlotsDir(stateRoot) {
 }
 
 /**
- * Acquires a cross-process slot lease using atomic exclusive file creation (flag 'wx').
+ * Acquires a cross-process slot lease using an owner-bearing lock and atomic publication.
  * Ensures slot file includes jobId, attemptId, pid, creationTime, executable, commandLine, acquiredAt.
  */
 export async function acquireSlot(options = {}) {
@@ -93,7 +93,7 @@ export async function acquireSlot(options = {}) {
     } catch {}
   }
 
-  // Iterate slots 0 .. maxSlots - 1 attempting atomic exclusive create
+  // Iterate slots 0 .. maxSlots - 1 attempting locked atomic publication
   for (let slotId = 0; slotId < maxSlots; slotId += 1) {
     const slotPath = path.join(slotsDir, `slot-${slotId}.json`);
     const leaseData = {
@@ -113,10 +113,13 @@ export async function acquireSlot(options = {}) {
 
     try {
       const result = await withSlotLock(slotPath, async () => {
-        await fsp.writeFile(slotPath, JSON.stringify(leaseData, null, 2), {
-        flag: "wx",
-        encoding: "utf8",
-        });
+        // All writers hold the slot lock. Never overwrite an existing lease;
+        // publish a fully written, synced temporary file with atomic rename.
+        try {
+          await fsp.access(slotPath);
+          throw Object.assign(new Error("Slot already held"), { code: "EEXIST" });
+        } catch (err) { if (err.code !== "ENOENT") throw err; }
+        await writeJsonAtomic(slotPath, leaseData);
         return true;
       });
       if (result?.locked) continue;
@@ -203,9 +206,7 @@ export async function activateReservedSlot(options = {}) {
       metadata: { ...(current.metadata || {}), ...(extraMetadata || {}), phase: "active" },
     };
 
-    const tmpPath = `${slotPath}.${crypto.randomUUID()}.tmp`;
-    await fsp.writeFile(tmpPath, JSON.stringify(updatedLease, null, 2), "utf8");
-    await fsp.rename(tmpPath, slotPath);
+    await writeJsonAtomic(slotPath, updatedLease);
 
     return { activated: true, slotId: updatedLease.slotId, slotPath, lease: updatedLease };
   });
@@ -381,6 +382,18 @@ export async function scanLeases(options = {}) {
     await fsp.mkdir(slotsDir, { recursive: true });
   } catch {}
 
+  // One OS identity query per PID within this scan (controllers commonly own
+  // multiple reservations). Never reuse these probes across scans or kills.
+  const probes = new Map();
+  const scanSupervisor = {
+    queryProcessIdentity(pid) {
+      const key = Number(pid);
+      if (!probes.has(key)) probes.set(key, processSupervisor.queryProcessIdentity(key));
+      return probes.get(key);
+    },
+    validateProcessIdentity: (...args) => processSupervisor.validateProcessIdentity(...args),
+  };
+
   const slots = [];
   const active = [];
   const stale = [];
@@ -389,6 +402,7 @@ export async function scanLeases(options = {}) {
   const orphans = [];
   const corrupt = [];
   const freeSlots = [];
+  const locked = [];
 
   for (let slotId = 0; slotId < maxSlots; slotId += 1) {
     const slotPath = path.join(slotsDir, `slot-${slotId}.json`);
@@ -397,8 +411,18 @@ export async function scanLeases(options = {}) {
       raw = await fsp.readFile(slotPath, "utf8");
     } catch (err) {
       if (err.code === "ENOENT") {
-        freeSlots.push(slotId);
-        slots.push({ slotId, status: "free", slotPath });
+        // A slot without a lease may still be held by a publisher (or a
+        // legacy orphan lock). Do not advertise that capacity as free.
+        try {
+          await fsp.lstat(`${slotPath}.lock`);
+          const item = { slotId, status: "locked", slotPath };
+          locked.push(item);
+          slots.push(item);
+        } catch (lockError) {
+          if (lockError.code !== "ENOENT") throw lockError;
+          freeSlots.push(slotId);
+          slots.push({ slotId, status: "free", slotPath });
+        }
         continue;
       }
       throw err;
@@ -415,7 +439,7 @@ export async function scanLeases(options = {}) {
     }
 
     const classification = await classifyLease(parsed, {
-      processSupervisor,
+      processSupervisor: scanSupervisor,
       staleTimeoutMs,
     });
 
@@ -460,6 +484,7 @@ export async function scanLeases(options = {}) {
     orphans,
     corrupt,
     freeSlots,
+    locked,
     activeCount: active.length,
     availableCount: freeSlots.length,
   };
@@ -491,7 +516,12 @@ export async function reclaimLeases(options = {}) {
   });
 
   const reclaimed = [];
-  const blocked = [];
+  // Corruption is not proof of a dead owner. Surface it explicitly rather
+  // than deleting an unknown live worker's admission record.
+  const blocked = [
+    ...scan.corrupt.map(item => ({ slotId: item.slotId, reason: "corrupt_lease" })),
+    ...scan.locked.map(item => ({ slotId: item.slotId, reason: "slot_locked" })),
+  ];
   const ambiguous = [...scan.ambiguous];
 
   // 1. Reclaim dead owners (process verified not running)
@@ -643,6 +673,8 @@ export async function getCounts(options = {}) {
     staleCount: scan.stale.length,
     deadCount: scan.dead.length,
     orphanCount: scan.orphans.length,
+    corruptCount: scan.corrupt.length,
+    lockedCount: scan.locked.length,
   };
 }
 

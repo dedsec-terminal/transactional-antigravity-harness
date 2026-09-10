@@ -19,10 +19,46 @@ import {
 } from "../../skills/delegate-to-antigravity/scripts/lib/controller.mjs";
 import { readActivityEvents } from "../../skills/delegate-to-antigravity/scripts/lib/activity.mjs";
 import { runGit, finalizeWorktree, verifyWorktreeOwnership } from "../../skills/delegate-to-antigravity/scripts/lib/git-worktree.mjs";
+import { collectEligibleJobs } from "../../skills/delegate-to-antigravity/scripts/lib/ledger.mjs";
 import { createJob, updateJobState } from "../../skills/delegate-to-antigravity/scripts/lib/ledger.mjs";
 import { getActiveCount } from "../../skills/delegate-to-antigravity/scripts/lib/leases.mjs";
 
 async function tempRoot(prefix) { return fsp.mkdtemp(path.join(os.tmpdir(), prefix)); }
+
+test('CLI timeout warnings and fatal stderr cannot become successful attempts', async () => {
+  const root = await tempRoot('agy-cli-outcome-');
+  try {
+    for (const [stderr, expected] of [
+      ['Warning: --print-timeout expired; returning partial output.', 'timed_out'],
+      ['error: model request failed', 'failed'],
+    ]) {
+      const prepared = await persistBeforeSpawn({ root, params: { cwd: root, mode: 'plan', prompt: 'fixture' } });
+      const result = await completeRun(root, prepared.job.jobId, prepared.attempt.attemptId, {
+        exitCode: 0, stdout: terminal({ status: 'success', summary: 'partial', verification: 'unverified', claimedChangedPaths: [] }),
+        stderr, timedOut: false, truncated: false,
+      });
+      assert.equal(result.execution, expected);
+    }
+  } finally { await fsp.rm(root, { recursive: true, force: true }); }
+});
+
+test('collect preserves expired evidence when callback records are corrupt', async () => {
+  const root = await tempRoot('agy-corrupt-outbox-');
+  try {
+    const old = Date.now() - 20 * 86400000;
+    const job = await createJob(root, {}, { now: old });
+    await updateJobState(root, job.jobId, { lifecycle: 'running' }, { now: old });
+    await updateJobState(root, job.jobId, { lifecycle: 'completed' }, { now: old });
+    await fsp.mkdir(path.join(root, 'outbox'));
+    await fsp.writeFile(path.join(root, 'outbox', 'unknown.json'), '{malformed');
+    const result = await runJobAction(root, 'collect', undefined, { dryRun: false });
+    assert.deepEqual(result.collected, []);
+    await fsp.access(path.join(root, 'jobs', job.jobId, 'state.json'));
+    for (const options of [{ evidenceRetentionMs: false }, { retentionMs: '0' }, { dryRun: 'false' }]) {
+      await assert.rejects(runJobAction(root, 'collect', undefined, options));
+    }
+  } finally { await fsp.rm(root, { recursive: true, force: true }); }
+});
 
 async function initRepo() {
   const repo = await tempRoot("agy-controller-repo-");
@@ -62,6 +98,19 @@ test("safe defaults, retention bounds, and exact async public response", () => {
   const output = exactAsyncResponse("thread-1", { jobId: "job-1", attempt: 1 });
   assert.deepEqual(JSON.parse(output.split(/\r?\n/)[0]), { status: "dispatched_async", thread: "thread-1" });
   assert.match(output.split(/\r?\n/)[1], /^AGY_META /);
+});
+
+test("retention collection validates defaults and malformed options", async () => {
+  const root = await tempRoot("agy-retention-options-");
+  try {
+    const preview = await collectEligibleJobs(root, { dryRun: true });
+    assert.deepEqual(preview, { collected: [], skipped: [], worktrees: [] });
+    await assert.rejects(collectEligibleJobs(root, { evidenceRetentionMs: Number.NaN }), /finite/);
+    await assert.rejects(collectEligibleJobs(root, { worktreeRetentionMs: -1 }), /non-negative/);
+    await assert.rejects(collectEligibleJobs(root, { dryRun: "false" }), /boolean/);
+  } finally {
+    await fsp.rm(root, { recursive: true, force: true });
+  }
 });
 
 test("shared plan persists before execution and seals immutable typed result", async () => {

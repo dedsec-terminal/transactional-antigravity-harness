@@ -34,7 +34,7 @@ The repository coordinates atomic subagent execution through an MCP server inter
 ### Focused Change Workflow
 1. **Targeted Scope**: Always scope changes to explicit, non-overlapping target files or module prefixes. Avoid large refactors or incidental formatting changes across unrelated files.
 2. **Worktree Isolation**: Never mutate shared state directly during exploratory or agent runs. The harness uses `isolation: "worktree"` for mutating delegations. Changes must be reviewed and explicitly applied.
-3. **Disjoint Concurrency**: When splitting tasks across parallel workers, ensure disjoint target paths with a maximum concurrency limit of 4 worker slots (`MAX_WORKER_SLOTS = 4`).
+3. **Disjoint Concurrency**: When splitting tasks across parallel workers, ensure disjoint target paths with a hard maximum of 8 worker slots, subject to adaptive CPU/memory admission (`MAX_WORKER_SLOTS = 8`).
 4. **Untrusted Worker Output**: In this architecture, worker execution claims are considered untrusted until parent verification executes automated checks.
 
 ---
@@ -63,8 +63,8 @@ To verify MCP protocol communication independently:
 npm run test:protocol
 ```
 
-### Root Integration Tests
-From the workspace root directory:
+### Root Test Aliases
+These convenience entry points import the same suites already included in `npm test`; they are not additional, orphaned tests. From the workspace root directory:
 ```bash
 node test/leases.test.mjs
 node test/ledger.test.mjs

@@ -23,9 +23,9 @@ export function parseProcessDate(val) {
   if (dmtfMatch) {
     const [, y, m, d, h, min, s, frac, tz] = dmtfMatch;
     const ms = frac.slice(0, 3).padEnd(3, "0");
-    const tzFormatted = tz ? `${tz.slice(0, 3)}:${tz.slice(3)}` : "Z";
-    const iso = `${y}-${m}-${d}T${h}:${min}:${s}.${ms}${tzFormatted}`;
-    const parsed = Date.parse(iso);
+    // DMTF offsets are signed minutes, not HHMM.
+    const iso = `${y}-${m}-${d}T${h}:${min}:${s}.${ms}Z`;
+    const parsed = Date.parse(iso) - Number(tz || 0) * 60_000;
     if (!Number.isNaN(parsed)) return parsed;
   }
 
@@ -69,11 +69,6 @@ export function compareExecutables(exe1, exe2, platform = process.platform) {
     const c1 = canonical(s1);
     const c2 = canonical(s2);
     return Boolean(c1 && c2 && c1 === c2);
-  } else {
-    if (s1 === s2) return true;
-    const b1 = path.basename(s1);
-    const b2 = path.basename(s2);
-    if (b1 === b2) return true;
   }
   return false;
 }
@@ -108,7 +103,7 @@ export function compareCommandLines(cmd1, cmd2) {
  */
 export function validateProcessIdentity(recordedIdentity, liveIdentity, options = {}) {
   const platform = options.platform || process.platform;
-  const toleranceMs = options.toleranceMs ?? 2000;
+  const toleranceMs = options.toleranceMs ?? (platform === "win32" ? 2000 : 0);
 
   if (!recordedIdentity) {
     return {
@@ -191,7 +186,9 @@ export function validateProcessIdentity(recordedIdentity, liveIdentity, options 
       },
     };
   }
-  if (!compareCommandLines(recordedIdentity.commandLine, liveIdentity.commandLine)) {
+  if (!(platform === "win32"
+    ? compareCommandLines(recordedIdentity.commandLine, liveIdentity.commandLine)
+    : recordedIdentity.commandLine === liveIdentity.commandLine)) {
     return {
       matches: false,
       reason: "command_line_mismatch",
@@ -277,7 +274,7 @@ export function defaultCommandRunner({
  */
 export async function queryProcessIdentity(pid, options = {}) {
   const targetPid = Number(pid);
-  if (!targetPid || targetPid <= 0) {
+  if (!Number.isSafeInteger(targetPid) || targetPid <= 0) {
     return { running: false, identity: null, reason: "invalid_pid" };
   }
 
@@ -296,6 +293,9 @@ export async function queryProcessIdentity(pid, options = {}) {
         windowsHide: true,
       });
 
+      if (res.timedOut || (res.exitCode != null && res.exitCode !== 0)) {
+        return { running: true, identity: null, reason: "probe_failed" };
+      }
       const stdout = res.stdout ? res.stdout.trim() : "";
       if (!stdout || stdout === "null") {
         return { running: false, identity: null };
@@ -305,11 +305,11 @@ export async function queryProcessIdentity(pid, options = {}) {
       try {
         data = JSON.parse(stdout);
       } catch {
-        return { running: false, identity: null, reason: "unparseable_output" };
+        return { running: true, identity: null, reason: "unparseable_output" };
       }
 
-      if (!data || !data.ProcessId) {
-        return { running: false, identity: null };
+      if (!data || Number(data.ProcessId) !== targetPid) {
+        return { running: true, identity: null, reason: "unparseable_output" };
       }
 
       let creationTime = null;
@@ -332,53 +332,61 @@ export async function queryProcessIdentity(pid, options = {}) {
         },
       };
     } catch (err) {
-      return { running: false, identity: null, error: err.message };
+      return { running: true, identity: null, reason: "probe_failed", error: err.message };
     }
   } else {
-    // POSIX fallback / mocked
-    let isAlive = false;
+    // ESRCH proves absence. Permission/probe errors do not: keep ownership
+    // ambiguous so a failed probe can never authorize reclaim or termination.
+    try { process.kill(targetPid, 0); }
+    catch (err) {
+      if (err.code === "ESRCH") return { running: false, identity: null };
+    }
     try {
-      process.kill(targetPid, 0);
-      isAlive = true;
-    } catch (err) {
-      if (err.code === "ESRCH") {
-        return { running: false, identity: null };
-      }
-      isAlive = true;
-    }
-
-    if (options.commandRunner) {
-      try {
-        const res = await commandRunner({
-          command: "ps",
-          args: ["-p", String(targetPid), "-o", "pid=,lstart=,comm=,args="],
-          timeoutMs: 2000,
-        });
-        if (res && res.stdout && res.stdout.trim()) {
-          return {
-            running: true,
-            identity: {
-              pid: targetPid,
-              creationTime: new Date().toISOString(),
-              executable: "ps_process",
-              commandLine: res.stdout.trim(),
-            },
-          };
+      if (platform === "linux") {
+        const proc = `/proc/${targetPid}`;
+        const stat = await fsp.readFile(`${proc}/stat`, "utf8");
+        const fields = stat.slice(stat.lastIndexOf(")") + 2).trim().split(/\s+/);
+        if (fields[0] === "Z" || fields[0] === "X") return { running: false, identity: null };
+        const startTicks = fields[19]; // field 22, after pid and (comm)
+        const [bootId, executable, argv] = await Promise.all([
+          fsp.readFile("/proc/sys/kernel/random/boot_id", "utf8"),
+          fsp.readlink(`${proc}/exe`),
+          fsp.readFile(`${proc}/cmdline`),
+        ]);
+        const after = await fsp.readFile(`${proc}/stat`, "utf8");
+        if (after.slice(after.lastIndexOf(")") + 2).trim().split(/\s+/)[19] !== startTicks) {
+          return { running: true, identity: null, reason: "process_changed_during_probe" };
         }
-      } catch {}
+        // A boot-scoped kernel start token is exact and independent of clock
+        // changes, scheduling delay, or date comparison tolerance.
+        return { running: true, identity: {
+          pid: targetPid,
+          creationTime: `linux:${bootId.trim()}:${startTicks}`,
+          executable,
+          commandLine: argv.toString("utf8").replace(/\0/g, " ").trim(),
+        } };
+      }
+      if (platform !== "darwin") return { running: true, identity: null, reason: "unsupported_platform" };
+      // Query columns separately: executable paths may contain spaces.
+      const query = async (column) => {
+        const res = await commandRunner({ command: "ps", args: ["-ww", "-p", String(targetPid), "-o", `${column}=`],
+          env: { ...process.env, LC_ALL: "C", TZ: "UTC" }, timeoutMs: options.timeoutMs ?? 2000 });
+        if (res.timedOut || (res.exitCode != null && res.exitCode !== 0) || !res.stdout?.trim()) throw new Error("ps probe failed");
+        return res.stdout.trim();
+      };
+      const state = await query("stat");
+      if (state.startsWith("Z")) return { running: false, identity: null };
+      const started = await query("lstart");
+      const [executable, commandLine] = await Promise.all([query("comm"), query("args")]);
+      if (started !== await query("lstart")) throw new Error("process changed during probe");
+      const date = Date.parse(`${started} UTC`);
+      if (!Number.isFinite(date)) throw new Error("invalid process start time");
+      return { running: true, identity: { pid: targetPid, creationTime: new Date(date).toISOString(), executable, commandLine } };
+    } catch (err) {
+      try { process.kill(targetPid, 0); }
+      catch (probe) { if (probe.code === "ESRCH") return { running: false, identity: null }; }
+      return { running: true, identity: null, reason: "probe_failed", error: err.message };
     }
-
-    return {
-      running: isAlive,
-      identity: isAlive
-        ? {
-            pid: targetPid,
-            creationTime: new Date().toISOString(),
-            executable: "posix_process",
-            commandLine: `process ${targetPid}`,
-          }
-        : null,
-    };
   }
 }
 
@@ -436,7 +444,7 @@ export async function terminateProcess(options = {}) {
   } = options;
 
   const targetPid = Number(pid);
-  if (!targetPid || targetPid <= 0) {
+  if (!Number.isSafeInteger(targetPid) || targetPid <= 0) {
     return { stopped: false, reason: "invalid_pid" };
   }
 
@@ -490,19 +498,29 @@ export async function terminateProcess(options = {}) {
   // 3. Graceful signal
   events?.push({ type: "graceful_signal_sent", pid: targetPid, signal });
   try {
-    if (child && typeof child.kill === "function") {
+    if (platform !== "win32") {
+      try { process.kill(-targetPid, signal); }
+      catch { process.kill(targetPid, signal); }
+    } else if (child && typeof child.kill === "function") {
       child.kill(signal);
     } else {
       process.kill(targetPid, signal);
     }
   } catch {}
 
+  const pollRunning = async () => {
+    if (platform === "win32" && process.platform === "win32" && commandRunner === defaultCommandRunner) {
+      try { process.kill(targetPid, 0); return true; }
+      catch (err) { return err.code !== "ESRCH"; }
+    }
+    return (await queryProcessIdentity(targetPid, { commandRunner, platform })).running;
+  };
+
   // 4. Bounded wait for graceful termination
   const startTime = Date.now();
   while (Date.now() - startTime < gracePeriodMs) {
     await new Promise((r) => setTimeout(r, pollIntervalMs));
-    const probe = await queryProcessIdentity(targetPid, { commandRunner, platform });
-    if (!probe.running) {
+    if (!await pollRunning()) {
       events?.push({
         type: "graceful_stop_verified",
         pid: targetPid,
@@ -559,8 +577,7 @@ export async function terminateProcess(options = {}) {
   const postKillDeadline = Date.now() + 2000;
   while (Date.now() < postKillDeadline) {
     await new Promise((r) => setTimeout(r, pollIntervalMs));
-    const postProbe = await queryProcessIdentity(targetPid, { commandRunner, platform });
-    if (!postProbe.running) {
+    if (!await pollRunning()) {
       events?.push({ type: "force_kill_verified", pid: targetPid });
       return { stopped: true, method: "force_tree_kill", pid: targetPid };
     }
@@ -576,79 +593,6 @@ export async function terminateProcess(options = {}) {
 }
 
 export const terminateProcessTree = terminateProcess;
-
-function processIsRunning(pid) {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (err) {
-    return err.code !== "ESRCH";
-  }
-}
-
-/**
- * Terminates a harness-owned child and its descendants. On POSIX the child is
- * expected to have been spawned detached (its own process group); termination
- * escalates SIGTERM -> bounded grace -> SIGKILL to that group. The
- * orchestrator's own process group is never signaled. When a recorded identity
- * is available the shared identity-aware terminateProcess path is used;
- * otherwise only the owned child handle and its dedicated group are touched.
- */
-export async function terminateOwnedProcessTree(options = {}) {
-  const {
-    child = null,
-    pid: rawPid,
-    identity = null,
-    gracePeriodMs = 1500,
-    pollIntervalMs = 50,
-    platform = process.platform,
-    commandRunner = defaultCommandRunner,
-  } = options;
-
-  const pid = Number(rawPid ?? child?.pid ?? 0);
-  if (!pid || pid <= 0 || pid === process.pid) {
-    return { stopped: false, reason: "invalid_pid" };
-  }
-
-  if (platform === "win32") {
-    try {
-      await commandRunner({
-        command: "taskkill",
-        args: ["/PID", String(pid), "/T", "/F"],
-        timeoutMs: 5000,
-        windowsHide: true,
-      });
-      return { stopped: true, method: "taskkill", pid };
-    } catch (err) {
-      return { stopped: false, reason: "taskkill_failed", error: err.message, pid };
-    }
-  }
-
-  if (identity && identity.pid) {
-    return terminateProcess({ pid, identity, child, gracePeriodMs, pollIntervalMs, platform });
-  }
-
-  try {
-    if (child && typeof child.kill === "function") child.kill("SIGTERM");
-    else process.kill(pid, "SIGTERM");
-  } catch {}
-
-  const started = Date.now();
-  while (Date.now() - started < gracePeriodMs) {
-    await new Promise((resolve) => setTimeout(resolve, pollIntervalMs));
-    if (!processIsRunning(pid)) return { stopped: true, method: "graceful", pid };
-  }
-
-  try {
-    process.kill(-pid, "SIGKILL");
-  } catch {
-    try {
-      if (child && typeof child.kill === "function") child.kill("SIGKILL");
-      else process.kill(pid, "SIGKILL");
-    } catch {}
-  }
-  return { stopped: true, method: "group_sigkill", pid };
-}
 
 /**
  * Spawns a detached worker process suitable for background / detached controllers
@@ -683,13 +627,8 @@ export async function spawnDetachedWorker(options = {}) {
   });
 
   const pid = child.pid;
-  const creationTime = new Date().toISOString();
-  const identity = {
-    pid,
-    creationTime,
-    executable: command,
-    commandLine: [command, ...args].join(" "),
-  };
+  const probe = await queryProcessIdentity(pid);
+  const identity = probe.identity;
 
   child.unref();
 
@@ -707,7 +646,7 @@ export class WindowsProcessSupervisor {
   constructor(options = {}) {
     this.platform = options.platform || process.platform;
     this.commandRunner = options.commandRunner || defaultCommandRunner;
-    this.toleranceMs = options.toleranceMs ?? 2000;
+    this.toleranceMs = options.toleranceMs ?? (this.platform === "win32" ? 2000 : 0);
     if (typeof options.queryProcessIdentity === "function") {
       this._customQueryProcessIdentity = options.queryProcessIdentity;
     } else if (typeof options.processProbe === "function") {

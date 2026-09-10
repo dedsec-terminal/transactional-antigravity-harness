@@ -403,6 +403,7 @@ describe("Evidence Capture & Apply Roundtrip", () => {
         targetRepoPath: repoDir,
         patch: evidence.patch,
         manifest: evidence.manifest,
+        manifestHash: evidence.manifestHash,
       });
 
       assert.equal(applyRes.blocked, true);
@@ -432,12 +433,17 @@ describe("Evidence Capture & Apply Roundtrip", () => {
         repoRoot: repoDir,
       });
 
+      const missingHash = await applyPatch({ targetRepoPath: repoDir, patch: evidence.patch, manifest: evidence.manifest });
+      assert.deepEqual(missingHash.reasons, ["MANIFEST_HASH_REQUIRED"]);
+      assert.equal(missingHash.applied, false);
+
       // 1. Base SHA mismatch: canonical repo has a new commit
       await commitFiles(repoDir, { "unrelated.txt": "advance head\n" });
       const resBaseMismatch = await applyPatch({
         targetRepoPath: repoDir,
         patch: evidence.patch,
         manifest: evidence.manifest,
+        manifestHash: evidence.manifestHash,
       });
       assert.equal(resBaseMismatch.blocked, true);
       assert.ok(resBaseMismatch.reasons.includes("BASE_SHA_MISMATCH"));
@@ -451,6 +457,7 @@ describe("Evidence Capture & Apply Roundtrip", () => {
         targetRepoPath: repoDir,
         patch: corruptedPatch,
         manifest: evidence.manifest,
+        manifestHash: evidence.manifestHash,
       });
       assert.equal(resPatchMismatch.blocked, true);
       assert.ok(resPatchMismatch.reasons.includes("PATCH_HASH_MISMATCH"));
@@ -521,6 +528,7 @@ describe("Evidence Capture & Apply Roundtrip", () => {
         targetRepoPath: repoDir,
         patch: evidence.patch,
         manifest: evidence.manifest,
+        manifestHash: evidence.manifestHash,
       });
 
       assert.equal(resConflict.blocked, true);
@@ -607,8 +615,21 @@ describe("Evidence Capture & Apply Roundtrip", () => {
         handle = await fsp.open(targetFilePath, "r");
       }
 
-      const finalized = await finalizeWorktree(worktreePath, { repoRoot: repoDir });
-      assert.equal(finalized.status, "removed");
+      // Try finalize while file is open
+      const firstFinalize = await finalizeWorktree(worktreePath, {
+        repoRoot: repoDir,
+        removeRunner: async () => ({ status: 1, stderr: "EBUSY: file is used by another process", stdout: "" }),
+      });
+
+      assert.equal(firstFinalize.status, "pending_prune");
+      assert.ok(firstFinalize.error);
+
+      // Close the open handle
+      await handle.close();
+
+      // Now finalize should succeed
+      const secondFinalize = await finalizeWorktree(worktreePath, { repoRoot: repoDir });
+      assert.equal(secondFinalize.status, "removed");
       assert.equal(fs.existsSync(worktreePath), false);
     } finally {
       if (handle) await handle.close().catch(() => {});

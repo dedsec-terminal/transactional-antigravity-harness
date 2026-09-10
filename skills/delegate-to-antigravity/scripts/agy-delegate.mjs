@@ -16,6 +16,7 @@ import {
   markCallbackDelivered,
   markCallbackFailed,
   persistBeforeSpawn,
+  parseTerminalResult as parseTerminalEvent,
   recordWorkerSpawn,
   releaseWorker,
   reserveWorker,
@@ -28,7 +29,8 @@ import {
   recommendWorkerCapacity,
   sampleSystemCapacity,
 } from "./lib/system-capacity.mjs";
-import { queryProcessIdentity, terminateOwnedProcessTree } from "./lib/windows-process.mjs";
+import { terminateOwnedProcessTree } from "./lib/owned-process.mjs";
+import { queryProcessIdentity } from "./lib/windows-process.mjs";
 import { createBoundedStreamCollector } from "./lib/storage.mjs";
 
 const VERSION = "1.1.0";
@@ -42,6 +44,10 @@ const CALLBACK_FIELD_CHARS = 1_000;
 let activeChild;
 let activeChildIdentity = null;
 let handlingSignal = false;
+
+async function terminateProcessTree(child, identity = null) {
+  return terminateOwnedProcessTree({ child, identity, gracePeriodMs: 1500 });
+}
 
 function fail(message, exitCode = 2) {
   process.stderr.write(`${message}\n`);
@@ -166,10 +172,6 @@ async function findCodex() {
   return undefined;
 }
 
-async function terminateProcessTree(child, identity = null) {
-  if (!child?.pid) return { stopped: false, reason: "invalid_pid" };
-  return terminateOwnedProcessTree({ child, identity, gracePeriodMs: 1500 });
-}
 
 function installSignalHandlers() {
   for (const [signal, exitCode] of [["SIGINT", 130], ["SIGTERM", 143]]) {
@@ -230,7 +232,21 @@ function run(command, args, cwd, timeoutMs, stdinText, onSpawn) {
 
     timer = setTimeout(() => {
       timedOut = true;
-      void terminateProcessTree(child, childIdentity);
+      void terminateProcessTree(child, childIdentity).then(cleanup => finish(() => {
+        child.stdin.destroy();
+        child.stdout.destroy();
+        child.stderr.destroy();
+        child.unref();
+        const stdoutCapture = stdoutCollector.finish();
+        const stderrCapture = stderrCollector.finish();
+        resolve({ exitCode: null, stdout: stdoutCapture.content, stderr: stderrCapture.content,
+          stdoutBytes: stdoutCapture.totalBytes, stderrBytes: stderrCapture.totalBytes,
+          timedOut: true, cleanupFailed: !cleanup?.stopped,
+          truncated: stdoutCapture.truncated || stderrCapture.truncated });
+      })).catch(() => finish(() => {
+        child.stdin.destroy(); child.stdout.destroy(); child.stderr.destroy(); child.unref();
+        resolve({ exitCode: null, stdout: '', stderr: 'Process cleanup failed', timedOut: true, cleanupFailed: true, truncated: true });
+      }));
     }, timeoutMs);
 
     child.on("close", (exitCode) => finish(() => {
@@ -263,17 +279,7 @@ async function stableProcessIdentity(pid) {
 }
 
 function parseTerminalResult(stdout) {
-  let terminal;
-  for (const line of stdout.split(/\r?\n/)) {
-    if (!line.trim()) continue;
-    try {
-      const event = JSON.parse(line);
-      if (event?.event === "result" && event.result) terminal = event.result;
-    } catch {
-      // Ignore non-JSON progress lines; the terminal result is authoritative.
-    }
-  }
-  return terminal;
+  return parseTerminalEvent(stdout)?.result;
 }
 
 function sanitizeLine(value, fallback) {
@@ -385,7 +391,7 @@ if (options.check) {
     // Keep --check available even if capacity sampling or recommendation fails.
   }
   const checkPayload = {
-    available: true,
+    available: !health.error && health.ledger?.healthy === true,
     executable,
     runnerVersion: VERSION,
     codexCallbackAvailable: Boolean(codex),
@@ -469,7 +475,7 @@ if (context.request.resumeSessionId) {
   agyArgs.push("--conversation", context.request.resumeSessionId);
 }
 if (options.agent) agyArgs.push("--agent", options.agent);
-agyArgs.push("--model", options.model || "gemini-3.8-flash-high");
+if (options.model) agyArgs.push("--model", options.model);
 
 let result;
 try {
@@ -494,7 +500,7 @@ const classified = classifyOutcome(result, terminal);
 result.permissionDenied = classified.permissionDenied;
 let completed;
 try { completed = await completeRun(context.root, context.job.jobId, context.attempt.attemptId, result); }
-finally { await releaseWorker(context.root, context.job.jobId, context.attempt.attemptId).catch(() => {}); }
+finally { if (!result.cleanupFailed) await releaseWorker(context.root, context.job.jobId, context.attempt.attemptId).catch(() => {}); }
 
 if (completed.callback) {
   const codex = await findCodex();
