@@ -68,16 +68,46 @@ async function runnerAvailable(): Promise<boolean> {
   }
 }
 
-function terminateProcessTree(child: ReturnType<typeof spawn>): void {
-  if (!child.pid) return;
+const KILL_GRACE_MS = 1_500;
+
+function processIsRunning(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code !== 'ESRCH';
+  }
+}
+
+// Terminates the owned child tree: SIGTERM, a bounded grace period, then
+// SIGKILL to the child's dedicated process group (children are spawned
+// detached on POSIX). The orchestrator's own process group is never signaled.
+function terminateProcessTree(child: ReturnType<typeof spawn>): Promise<void> {
+  const pid = child.pid;
+  if (!pid || pid === process.pid) return Promise.resolve();
   if (process.platform === 'win32') {
-    spawnSync('taskkill', ['/PID', String(child.pid), '/T', '/F'], {
+    spawnSync('taskkill', ['/PID', String(pid), '/T', '/F'], {
       windowsHide: true,
       stdio: 'ignore',
     });
-  } else {
-    child.kill('SIGTERM');
+    return Promise.resolve();
   }
+  try { child.kill('SIGTERM'); } catch { /* already gone */ }
+  return new Promise((resolve) => {
+    const started = Date.now();
+    const poll = setInterval(() => {
+      if (!processIsRunning(pid)) {
+        clearInterval(poll);
+        resolve();
+      } else if (Date.now() - started >= KILL_GRACE_MS) {
+        clearInterval(poll);
+        try { process.kill(-pid, 'SIGKILL'); }
+        catch { try { child.kill('SIGKILL'); } catch { /* already gone */ } }
+        resolve();
+      }
+    }, 50);
+    poll.unref();
+  });
 }
 
 function runProcess(command: string, args: string[], cwd: string, timeoutMs: number): Promise<RunResult> {
@@ -86,25 +116,33 @@ function runProcess(command: string, args: string[], cwd: string, timeoutMs: num
       cwd,
       env: process.env,
       windowsHide: true,
+      detached: process.platform !== 'win32',
       stdio: ['ignore', 'pipe', 'pipe'],
     });
-    let stdout: Buffer<ArrayBufferLike> = Buffer.alloc(0);
-    let stderr: Buffer<ArrayBufferLike> = Buffer.alloc(0);
+    const stdoutChunks: Buffer[] = [];
+    const stderrChunks: Buffer[] = [];
+    let stdoutBytes = 0;
+    let stderrBytes = 0;
     let truncated = false;
     let timedOut = false;
     let settled = false;
 
+    // Chunks are queued and concatenated once at close; previously every
+    // chunk copied the whole captured prefix.
     const append = (
-      current: Buffer<ArrayBufferLike>,
-      chunk: Buffer<ArrayBufferLike>,
-    ): Buffer<ArrayBufferLike> => {
-      if (current.length >= MAX_OUTPUT_BYTES) {
+      chunks: Buffer[],
+      chunk: Buffer,
+      captured: number,
+    ): number => {
+      if (captured >= MAX_OUTPUT_BYTES) {
         truncated = true;
-        return current;
+        return captured;
       }
-      const remaining = MAX_OUTPUT_BYTES - current.length;
+      const remaining = MAX_OUTPUT_BYTES - captured;
+      const piece = chunk.length > remaining ? chunk.subarray(0, remaining) : chunk;
       if (chunk.length > remaining) truncated = true;
-      return Buffer.concat([current, chunk.subarray(0, remaining)]);
+      chunks.push(piece);
+      return captured + piece.length;
     };
 
     let timer: NodeJS.Timeout;
@@ -115,19 +153,19 @@ function runProcess(command: string, args: string[], cwd: string, timeoutMs: num
       callback();
     };
 
-    child.stdout.on('data', (chunk: Buffer<ArrayBufferLike>) => { stdout = append(stdout, chunk); });
-    child.stderr.on('data', (chunk: Buffer<ArrayBufferLike>) => { stderr = append(stderr, chunk); });
+    child.stdout.on('data', (chunk: Buffer) => { stdoutBytes = append(stdoutChunks, chunk, stdoutBytes); });
+    child.stderr.on('data', (chunk: Buffer) => { stderrBytes = append(stderrChunks, chunk, stderrBytes); });
     child.on('error', (error) => finish(() => reject(error)));
 
     timer = setTimeout(() => {
       timedOut = true;
-      terminateProcessTree(child);
+      void terminateProcessTree(child);
     }, timeoutMs);
 
     child.on('close', (exitCode) => finish(() => resolve({
       exitCode,
-      stdout: stdout.toString('utf8'),
-      stderr: stderr.toString('utf8'),
+      stdout: Buffer.concat(stdoutChunks).toString('utf8'),
+      stderr: Buffer.concat(stderrChunks).toString('utf8'),
       timedOut,
       truncated,
     })));
@@ -404,17 +442,17 @@ function createServer(): McpServer {
   );
 
   server.registerTool('agy_job', {
-    title: 'Manage Antigravity Job',
-    description: 'Inspect or transition a transactional Antigravity job, or view bounded safe lifecycle events via args.limit (default50).',
+      title: 'Manage Antigravity Job',
+      description: 'Inspect or transition a transactional Antigravity job, or view bounded safe lifecycle events via args.limit (default50). The collect action performs retention maintenance and is dry-run unless args.dryRun is false.',
     inputSchema: z.object({
-      action: z.enum(['status', 'list', 'cancel', 'reconcile', 'apply', 'finalize', 'activity']),
+      action: z.enum(['status', 'list', 'cancel', 'reconcile', 'apply', 'finalize', 'activity', 'collect']),
       jobId: z.string().min(1).max(200).optional(),
       args: z.record(z.string(), z.unknown()).optional(),
     }),
     annotations: { readOnlyHint: false, openWorldHint: false, destructiveHint: true, idempotentHint: false },
   }, async ({ action, jobId, args: jobArgs }) => {
     if (!(await runnerAvailable())) return failure(`Antigravity runner was not found at: ${runnerPath()}`);
-    if (!['list', 'reconcile'].includes(action) && !jobId) return failure(`jobId is required for ${action}`);
+    if (!['list', 'reconcile', 'collect'].includes(action) && !jobId) return failure(`jobId is required for ${action}`);
     try {
       const payload = JSON.stringify({ ...(jobArgs ?? {}), ...(jobId ? { jobId } : {}) });
       const result = await runProcess(process.execPath, [runnerPath(), '--job-action', action, '--job-args-json', payload], pluginRoot(), 30_000);

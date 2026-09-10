@@ -28,7 +28,7 @@ import {
   recommendWorkerCapacity,
   sampleSystemCapacity,
 } from "./lib/system-capacity.mjs";
-import { queryProcessIdentity } from "./lib/windows-process.mjs";
+import { queryProcessIdentity, terminateOwnedProcessTree } from "./lib/windows-process.mjs";
 import { createBoundedStreamCollector } from "./lib/storage.mjs";
 
 const VERSION = "1.1.0";
@@ -40,6 +40,7 @@ const QUEUE_TIMEOUT_MS = 30_000;
 const CALLBACK_FIELD_CHARS = 1_000;
 
 let activeChild;
+let activeChildIdentity = null;
 let handlingSignal = false;
 
 function fail(message, exitCode = 2) {
@@ -165,16 +166,9 @@ async function findCodex() {
   return undefined;
 }
 
-function terminateProcessTree(child) {
-  if (!child?.pid) return;
-  if (process.platform === "win32") {
-    spawnSync("taskkill", ["/PID", String(child.pid), "/T", "/F"], {
-      windowsHide: true,
-      stdio: "ignore",
-    });
-  } else {
-    child.kill("SIGTERM");
-  }
+async function terminateProcessTree(child, identity = null) {
+  if (!child?.pid) return { stopped: false, reason: "invalid_pid" };
+  return terminateOwnedProcessTree({ child, identity, gracePeriodMs: 1500 });
 }
 
 function installSignalHandlers() {
@@ -182,8 +176,7 @@ function installSignalHandlers() {
     process.once(signal, () => {
       if (handlingSignal) return;
       handlingSignal = true;
-      terminateProcessTree(activeChild);
-      process.exit(exitCode);
+      void terminateProcessTree(activeChild, activeChildIdentity).finally(() => process.exit(exitCode));
     });
   }
 }
@@ -194,11 +187,13 @@ function run(command, args, cwd, timeoutMs, stdinText, onSpawn) {
       cwd,
       env: process.env,
       windowsHide: true,
+      detached: process.platform !== "win32",
       stdio: ["pipe", "pipe", "pipe"],
     });
     activeChild = child;
     const stdoutCollector = createBoundedStreamCollector(MAX_OUTPUT_BYTES);
     const stderrCollector = createBoundedStreamCollector(MAX_OUTPUT_BYTES);
+    let childIdentity = null;
     let timedOut = false;
     let settled = false;
 
@@ -207,7 +202,10 @@ function run(command, args, cwd, timeoutMs, stdinText, onSpawn) {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
-      if (activeChild === child) activeChild = undefined;
+      if (activeChild === child) {
+        activeChild = undefined;
+        activeChildIdentity = null;
+      }
       callback();
     };
 
@@ -219,17 +217,20 @@ function run(command, args, cwd, timeoutMs, stdinText, onSpawn) {
     child.on("error", (error) => finish(() => reject(error)));
     child.on("spawn", async () => {
       try {
-        if (onSpawn) await onSpawn(child);
+        if (onSpawn) {
+          childIdentity = await onSpawn(child) ?? null;
+          if (activeChild === child) activeChildIdentity = childIdentity;
+        }
         child.stdin.end(stdinText ?? "");
       } catch (error) {
-        terminateProcessTree(child);
+        void terminateProcessTree(child, childIdentity);
         finish(() => reject(error));
       }
     });
 
     timer = setTimeout(() => {
       timedOut = true;
-      terminateProcessTree(child);
+      void terminateProcessTree(child, childIdentity);
     }, timeoutMs);
 
     child.on("close", (exitCode) => finish(() => {
@@ -482,6 +483,7 @@ try {
   result = await run(executable, agyArgs, executionCwd, runConfig.timeoutSeconds * 1000 + WRAPPER_GRACE_MS, input, async (child) => {
     const identity = await stableProcessIdentity(child.pid);
     await recordWorkerSpawn(context.root, context.job.jobId, context.attempt.attemptId, identity);
+    return identity;
   });
 } catch (error) {
   result = { exitCode: null, stdout: "", stderr: error instanceof Error ? error.message : String(error), timedOut: false, truncated: false };

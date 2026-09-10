@@ -118,8 +118,9 @@ flowchart TD
 4. **Path Traversal Protection**: Target paths are constrained to the workspace root; directory traversal (`..`) attempts outside the workspace are rejected.
 5. **Retention Policies**:
 
-   * **Worktrees**: Retained for 24 hours (1,440 minutes by default) to allow manual inspection and debugging before disposal.
+   * **Worktrees**: Removed by explicit finalize; a finalized worktree that is still on disk (for example `pending_prune` after an open-handle failure) is retried by maintenance after the 24-hour worktree window.
    * **Evidence Ledger**: Job logs, terminal events, and hashes are kept for 14 days for forensic traceability.
+   * **Maintenance**: Collection is explicit and dry-run first. `agy_job` with `action: "collect"` previews eligible evidence; `args: { "dryRun": false }` applies the 14-day evidence and 24-hour worktree windows. Active, unfinalized, callback-pending, and corrupt jobs are never collected.
 
 ---
 

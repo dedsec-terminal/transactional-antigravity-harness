@@ -566,36 +566,52 @@ describe("Evidence Capture & Apply Roundtrip", () => {
       const worktreePath = path.join(worktreesBase, "wt-handle");
       await createWorktree({ repoRoot: repoDir, worktreePath, baseSha });
 
-      // Lock a file in the worktree by opening it with exclusive write or read lock
+      // Inject the EBUSY remove failure on every platform so the retry branch
+      // is tested deterministically; on POSIX an open handle cannot cause EBUSY
+      // because unlinking a file with an open handle is allowed.
+      const firstFinalize = await finalizeWorktree(worktreePath, {
+        repoRoot: repoDir,
+        removeRunner: async () => ({ status: 1, stderr: "EBUSY: file is used by another process", stdout: "" }),
+      });
+      assert.equal(firstFinalize.status, "pending_prune");
+      assert.ok(firstFinalize.error);
+      assert.equal(fs.existsSync(worktreePath), true);
+
+      // Retry without the injected failure now succeeds
+      const secondFinalize = await finalizeWorktree(worktreePath, { repoRoot: repoDir });
+      assert.equal(secondFinalize.status, "removed");
+      assert.equal(fs.existsSync(worktreePath), false);
+    } finally {
+      await cleanup();
+      await fsp.rm(worktreesBase, { recursive: true, force: true });
+    }
+  });
+
+  test("native POSIX finalize removes a worktree while a file handle is open", async (t) => {
+    if (process.platform === "win32") {
+      t.skip("POSIX unlink semantics do not apply on Windows");
+      return;
+    }
+    const { repoDir, cleanup } = await initTestRepo("agy-handle-posix-");
+    const worktreesBase = await createTempDir("agy-wts-handle-posix-");
+    let handle;
+    try {
+      const baseSha = await commitFiles(repoDir, { "file.txt": "hello\n" });
+      const worktreePath = path.join(worktreesBase, "wt-handle-posix");
+      await createWorktree({ repoRoot: repoDir, worktreePath, baseSha });
+
       const targetFilePath = path.join(worktreePath, "file.txt");
-      let handle;
       try {
         handle = await fsp.open(targetFilePath, "r+");
       } catch {
         handle = await fsp.open(targetFilePath, "r");
       }
 
-      // Try finalize while file is open
-      const firstFinalize = await finalizeWorktree(worktreePath, {
-        repoRoot: repoDir,
-        ...(process.platform === "win32"
-          ? { removeRunner: async () => ({ status: 1, stderr: "EBUSY: file is used by another process", stdout: "" }) }
-          : {}),
-      });
-
-      if (process.platform === "win32") {
-        assert.equal(firstFinalize.status, "pending_prune");
-        assert.ok(firstFinalize.error);
-      }
-
-      // Close the open handle
-      await handle.close();
-
-      // Now finalize should succeed
-      const secondFinalize = await finalizeWorktree(worktreePath, { repoRoot: repoDir });
-      assert.equal(secondFinalize.status, "removed");
+      const finalized = await finalizeWorktree(worktreePath, { repoRoot: repoDir });
+      assert.equal(finalized.status, "removed");
       assert.equal(fs.existsSync(worktreePath), false);
     } finally {
+      if (handle) await handle.close().catch(() => {});
       await cleanup();
       await fsp.rm(worktreesBase, { recursive: true, force: true });
     }

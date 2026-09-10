@@ -11,17 +11,12 @@ import {
   runGit,
   verifyWorktreeOwnership,
 } from "./git-worktree.mjs";
+import { canonicalJsonStringify } from "./storage.mjs";
 
+// Compatibility alias: manifest hashing must keep using sorted-key
+// serialization, so it reuses the single canonical implementation.
 export function deterministicJsonStringify(obj) {
-  if (obj === null || typeof obj !== "object") {
-    return JSON.stringify(obj);
-  }
-  if (Array.isArray(obj)) {
-    return `[${obj.map((item) => deterministicJsonStringify(item)).join(",")}]`;
-  }
-  const keys = Object.keys(obj).sort();
-  const pairs = keys.map((key) => `${JSON.stringify(key)}:${deterministicJsonStringify(obj[key])}`);
-  return `{${pairs.join(",")}}`;
+  return canonicalJsonStringify(obj);
 }
 
 export function hashManifest(manifest) {

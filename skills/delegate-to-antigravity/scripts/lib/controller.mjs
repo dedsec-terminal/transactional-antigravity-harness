@@ -2,13 +2,13 @@ import fsp from "node:fs/promises";
 import path from "node:path";
 
 import { resolveAgyRoot, ensureDir, generateUuid, sha256, sha256Json, writeJsonAtomic, readJson } from "./storage.mjs";
-import { createJob, createAttempt, getJob, getAttempt, getAttemptDir, getJobDir, listAttempts, updateJobState, updateAttemptState, sealAttempt, checkStorageHealth } from "./ledger.mjs";
+import { createJob, createAttempt, getJob, getAttempt, getAttemptDir, getJobDir, listAttempts, updateJobState, updateAttemptState, sealAttempt, checkStorageHealth, collectEligibleJobs, DEFAULT_EVIDENCE_RETENTION_MS, DEFAULT_WORKTREE_RETENTION_MS } from "./ledger.mjs";
 import { DEFAULT_RETENTION_MINUTES, TYPED_RESULT_SCHEMA, buildFourPillarPrompt, buildCallbackMessage, normalizeTargets, parseTypedResult, resolveIsolation } from "./contracts.mjs";
 import { enqueueOutboxRecord, getPendingOutboxRecords, listOutboxRecords, recordOutboxFailure, recordOutboxSuccess } from "./outbox.mjs";
 import { acquireSlot, activateReservedSlot, getActiveCount, getCounts, reclaimLeases, releaseSlot, reserveSlot } from "./leases.mjs";
 import { sampleSystemCapacity, recommendWorkerCapacity, DEFAULT_MAX_WORKERS } from "./system-capacity.mjs";
 import { appendActivityEvent, readActivityEvents } from "./activity.mjs";
-import { createWorktree, finalizeWorktree, validateRepository, verifyWorktreeOwnership } from "./git-worktree.mjs";
+import { canonicalPath, createWorktree, finalizeWorktree, listWorktrees, runGit, validateRepository, verifyWorktreeOwnership } from "./git-worktree.mjs";
 import { captureEvidence } from "./evidence.mjs";
 import { applyPatch } from "./apply.mjs";
 import { terminateProcess } from "./windows-process.mjs";
@@ -471,9 +471,37 @@ async function reconcileJobs(stateRoot, options = {}) {
   return { action: "reconcile", leases, callbacks: callbackResults, recovered };
 }
 
+// Crash recovery for an interrupted finalize: the intent was persisted after
+// ownership verification, so a missing directory on retry means removal
+// happened. Git registration is still rechecked and pruned before accepting it.
+async function reconcileRemovedWorktree(worktreePath, repoRoot) {
+  runGit(["worktree", "prune"], { cwd: repoRoot, allowFailure: true });
+  const target = canonicalPath(worktreePath).toLowerCase();
+  const stillRegistered = listWorktrees(repoRoot).some((tree) => tree.worktree.toLowerCase() === target);
+  if (stillRegistered) {
+    return { status: "pending_prune", worktreePath, error: "worktree is still registered after interrupted cleanup" };
+  }
+  return { status: "removed", worktreePath, reconciled: true };
+}
+
+// Explicit, dry-run-first retention maintenance. Kept off the hot path and
+// out of every delegation so evidence is only collected when an operator asks.
+async function collectJobs(stateRoot, options = {}) {
+  const dryRun = options.dryRun !== false;
+  const now = Number(options.now ?? Date.now());
+  const evidenceRetentionMs = Number(options.evidenceRetentionMs ?? options.retentionMs ?? DEFAULT_EVIDENCE_RETENTION_MS);
+  const worktreeRetentionMs = Number(options.worktreeRetentionMs ?? DEFAULT_WORKTREE_RETENTION_MS);
+  if (![now, evidenceRetentionMs, worktreeRetentionMs].every((value) => Number.isFinite(value) && value >= 0)) {
+    throw new Error("collect requires finite non-negative now, evidenceRetentionMs, and worktreeRetentionMs");
+  }
+  const result = await collectEligibleJobs(stateRoot, { now, evidenceRetentionMs, worktreeRetentionMs, dryRun });
+  return { action: "collect", dryRun, ...result };
+}
+
 export async function runJobAction(root, action, jobId, options = {}) {
   const stateRoot = resolveAgyRoot(root);
   if (action === "list") return { action, jobs: await listJobs(stateRoot) };
+  if (action === "collect") return collectJobs(stateRoot, options);
   if (action === "reconcile" && !jobId) return reconcileJobs(stateRoot, options);
   if (!jobId) throw new Error(`jobId is required for ${action}`);
   const job = await getJob(stateRoot, jobId);
@@ -514,10 +542,34 @@ export async function runJobAction(root, action, jobId, options = {}) {
     let cleanup = { status: "not_required" };
     const worktreePath = attempt.manifest.metadata?.worktreePath;
     if (worktreePath) {
-      cleanup = await finalizeWorktree(worktreePath, { repoRoot: job.manifest.cwd });
+      const intent = job.state.finalizeIntent;
+      const intentMatches = Boolean(intent?.worktreePath)
+        && canonicalPath(intent.worktreePath).toLowerCase() === canonicalPath(worktreePath).toLowerCase()
+        && (!intent.marker?.repoRoot
+          || canonicalPath(intent.marker.repoRoot).toLowerCase() === canonicalPath(job.manifest.cwd).toLowerCase());
+      if (!intentMatches) {
+        const verified = await verifyWorktreeOwnership(worktreePath, { repoRoot: job.manifest.cwd });
+        await updateJobState(stateRoot, jobId, {
+          finalizeIntent: {
+            worktreePath: verified.canonicalPath,
+            marker: verified.marker,
+            requestedAt: new Date().toISOString(),
+          },
+        }, { reason: "finalize_intent_recorded" });
+      }
+      try {
+        cleanup = await finalizeWorktree(worktreePath, { repoRoot: job.manifest.cwd });
+      } catch (error) {
+        if (intentMatches && error?.code === "WORKTREE_NOT_FOUND") {
+          cleanup = await reconcileRemovedWorktree(worktreePath, job.manifest.cwd);
+          if (cleanup.status !== "removed") return { action, jobId, finalized: false, blocked: true, cleanup };
+        } else {
+          throw error;
+        }
+      }
       if (cleanup.status === "pending_prune") return { action, jobId, finalized: false, cleanup };
     }
-    await updateJobState(stateRoot, jobId, { lifecycle: "completed", finalized: true });
+    await updateJobState(stateRoot, jobId, { lifecycle: "completed", finalized: true, finalizeIntent: null }, { reason: "finalized" });
     return { action, jobId, finalized: true, cleanup };
   }
   const attemptId = options.attemptId ?? job.state.activeAttemptId ?? job.state.lastAttemptId;

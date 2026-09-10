@@ -577,6 +577,79 @@ export async function terminateProcess(options = {}) {
 
 export const terminateProcessTree = terminateProcess;
 
+function processIsRunning(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    return err.code !== "ESRCH";
+  }
+}
+
+/**
+ * Terminates a harness-owned child and its descendants. On POSIX the child is
+ * expected to have been spawned detached (its own process group); termination
+ * escalates SIGTERM -> bounded grace -> SIGKILL to that group. The
+ * orchestrator's own process group is never signaled. When a recorded identity
+ * is available the shared identity-aware terminateProcess path is used;
+ * otherwise only the owned child handle and its dedicated group are touched.
+ */
+export async function terminateOwnedProcessTree(options = {}) {
+  const {
+    child = null,
+    pid: rawPid,
+    identity = null,
+    gracePeriodMs = 1500,
+    pollIntervalMs = 50,
+    platform = process.platform,
+    commandRunner = defaultCommandRunner,
+  } = options;
+
+  const pid = Number(rawPid ?? child?.pid ?? 0);
+  if (!pid || pid <= 0 || pid === process.pid) {
+    return { stopped: false, reason: "invalid_pid" };
+  }
+
+  if (platform === "win32") {
+    try {
+      await commandRunner({
+        command: "taskkill",
+        args: ["/PID", String(pid), "/T", "/F"],
+        timeoutMs: 5000,
+        windowsHide: true,
+      });
+      return { stopped: true, method: "taskkill", pid };
+    } catch (err) {
+      return { stopped: false, reason: "taskkill_failed", error: err.message, pid };
+    }
+  }
+
+  if (identity && identity.pid) {
+    return terminateProcess({ pid, identity, child, gracePeriodMs, pollIntervalMs, platform });
+  }
+
+  try {
+    if (child && typeof child.kill === "function") child.kill("SIGTERM");
+    else process.kill(pid, "SIGTERM");
+  } catch {}
+
+  const started = Date.now();
+  while (Date.now() - started < gracePeriodMs) {
+    await new Promise((resolve) => setTimeout(resolve, pollIntervalMs));
+    if (!processIsRunning(pid)) return { stopped: true, method: "graceful", pid };
+  }
+
+  try {
+    process.kill(-pid, "SIGKILL");
+  } catch {
+    try {
+      if (child && typeof child.kill === "function") child.kill("SIGKILL");
+      else process.kill(pid, "SIGKILL");
+    } catch {}
+  }
+  return { stopped: true, method: "group_sigkill", pid };
+}
+
 /**
  * Spawns a detached worker process suitable for background / detached controllers
  * WITHOUT shell command interpolation (shell: false).

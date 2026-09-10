@@ -7,25 +7,20 @@ import {
   validateProcessIdentity,
   terminateProcess,
 } from "./windows-process.mjs";
+import { withFileLock } from "./storage.mjs";
 
 export const DEFAULT_MAX_SLOTS = 4;
 export const DEFAULT_STALE_TIMEOUT_MS = 300_000; // 5 minutes
 
+// Non-blocking slot guard built on the shared lock primitive, so a crashed
+// guard holder is recovered by owner identity instead of wedging the slot.
 async function withSlotLock(slotPath, fn) {
-  const lockPath = `${slotPath}.lock`;
   try {
-    const nonce = crypto.randomUUID();
-    await fsp.writeFile(lockPath, nonce, { flag: "wx", encoding: "utf8" });
-    try {
-      return await fn(nonce);
-    } finally {
-      try {
-        const current = await fsp.readFile(lockPath, "utf8");
-        if (current === nonce) await fsp.unlink(lockPath);
-      } catch (err) { if (err.code !== "ENOENT") throw err; }
-    }
+    return await withFileLock(`${slotPath}.lock`, fn, { maxWaitMs: 0 });
   } catch (err) {
-    if (err.code === "EEXIST") return { locked: true };
+    if (err instanceof Error && /^Timed out acquiring lock /.test(err.message)) {
+      return { locked: true };
+    }
     throw err;
   }
 }
